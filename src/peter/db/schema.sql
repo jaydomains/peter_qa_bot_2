@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS specs (
 );
 CREATE INDEX IF NOT EXISTS idx_specs_site_id ON specs(site_id);
 CREATE INDEX IF NOT EXISTS idx_specs_active ON specs(site_id, is_active);
+-- Enforce a single active spec per site
+CREATE UNIQUE INDEX IF NOT EXISTS ux_specs_one_active_per_site ON specs(site_id) WHERE is_active = 1;
 
 CREATE TABLE IF NOT EXISTS reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

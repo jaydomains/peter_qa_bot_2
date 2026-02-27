@@ -73,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "ingest-spec":
             path = Path(args.file).expanduser().resolve()
             spec = spec_svc.ingest_spec(site_code=args.code, version_label=args.version, file_path=path)
-            print(f"OK spec ingested: site={args.code} spec_id={spec.id} version={spec.version_label}")
+            print(
+                f"OK spec ingested: site={args.code} spec_id={spec.id} version={spec.version_label} active={spec.is_active}"
+            )
+            if spec.extracted_text_path is None:
+                print("NOTE: PDF text extraction not available; extracted_text_path/checklist_json_path are empty.")
             return 0
 
         if args.cmd == "ingest-report":

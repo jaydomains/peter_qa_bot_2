@@ -6,6 +6,7 @@ __pycache__/
 *.sqlite
 *.db
 data/
+*.pdf
 .pytest_cache/
 .dist/
 dist/

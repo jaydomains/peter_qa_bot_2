@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 authors = [{name = "KhuselaBC"}]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 peter = "peter.interfaces.cli.main:main"
 
