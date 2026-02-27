@@ -36,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     rp_ingest.add_argument("--report-code", required=True, help="e.g. R03")
     rp_ingest.add_argument("--file", required=True, help="Path to report PDF")
 
+    ar = sub.add_parser("analyze-report", help="Run visual verification on a report (Vision)")
+    ar.add_argument("--code", required=True)
+    ar.add_argument("--report-code", required=True)
+
     q = sub.add_parser("query", help="Query site history")
     q.add_argument("--code", required=True)
     q.add_argument("--type", required=True, choices=["SUMMARY", "LATEST", "FAILS", "TOP_ISSUES"])
@@ -88,6 +92,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             if out.get("extracted_text_path") is None:
                 print("NOTE: no meaningful text extracted (OCR/Vision path needed later).")
+            return 0
+
+        if args.cmd == "analyze-report":
+            out = report_svc.analyze_report_visuals(site_code=args.code, report_code=args.report_code)
+            print(
+                f"OK visual analysis: report_id={out['report_id']} omissions={len(out['omission_issues_created'])} vision_json={out['vision_json']}"
+            )
             return 0
 
         if args.cmd == "query":
