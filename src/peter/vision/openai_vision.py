@@ -17,6 +17,7 @@ class VisionError(RuntimeError):
 @dataclass(frozen=True)
 class VisionFinding:
     defect: str
+    canonical_defects: list[str]
     confidence: float  # 0..1
     severity: str  # LOW|MED|HIGH|CRITICAL
     notes: str
@@ -49,6 +50,19 @@ def analyze_page_image(
     if not api_key:
         raise VisionError("OPENAI_API_KEY not set")
 
+    canonical_enum = [
+        "CRACKING",
+        "PEELING_FLAKING",
+        "BLISTERING",
+        "EFFLORESCENCE",
+        "DAMPNESS_MOULD_ALGAE",
+        "DELAMINATION",
+        "RUST_STAINING",
+        "POOR_COVERAGE_EXPOSED_SUBSTRATE",
+        "UNEVEN_SHEEN",
+        "TEXTURE_INCONSISTENCY",
+    ]
+
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -61,9 +75,13 @@ def analyze_page_image(
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["defect", "confidence", "severity", "notes"],
+                    "required": ["defect", "canonical_defects", "confidence", "severity", "notes"],
                     "properties": {
                         "defect": {"type": "string"},
+                        "canonical_defects": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": canonical_enum},
+                        },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "severity": {"type": "string", "enum": ["LOW", "MED", "HIGH", "CRITICAL"]},
                         "notes": {"type": "string"},
