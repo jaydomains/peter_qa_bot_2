@@ -95,9 +95,14 @@ def analyze_page_image(
                 ],
             }
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "vision_page_result", "schema": schema, "strict": True},
+        # New Responses API: formatting moved under text.format
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "vision_page_result",
+                "schema": schema,
+                "strict": True,
+            }
         },
     }
 
@@ -126,19 +131,30 @@ def analyze_page_image(
 
     data = json.loads(raw)
 
-    # Responses API returns structured output in output[].content[].text or .json depending on format.
-    # With json_schema, we expect content part with type=output_json.
+    # Responses API output parsing:
+    # - Some deployments return content type=output_json with field json
+    # - Others may return output_text with JSON string under text
     out_json = None
+    out_text = None
+
     for item in data.get("output", []) or []:
         for c in item.get("content", []) or []:
-            if c.get("type") == "output_json":
+            if c.get("type") == "output_json" and "json" in c:
                 out_json = c.get("json")
                 break
+            if c.get("type") in ("output_text", "text") and "text" in c:
+                out_text = c.get("text")
         if out_json is not None:
             break
 
+    if out_json is None and out_text:
+        try:
+            out_json = json.loads(out_text)
+        except Exception as e:
+            raise VisionError(f"Could not parse JSON output: {e}. Raw text: {out_text[:500]}") from e
+
     if out_json is None:
-        raise VisionError("No output_json found in response")
+        raise VisionError(f"No JSON output found in response. Keys: {list(data.keys())}")
 
     findings = [VisionFinding(**f) for f in (out_json.get("findings") or [])]
     return VisionPageResult(page_number=int(out_json["page_number"]), findings=findings, summary=str(out_json["summary"]))
