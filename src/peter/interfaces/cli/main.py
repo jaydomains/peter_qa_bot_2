@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--code", required=True)
     sr.add_argument("--report-code", required=True)
 
+    ia = sub.add_parser("image-audit", help="Audit report pages for photo/table/labels (no defect inference)")
+    ia.add_argument("--code", required=True)
+    ia.add_argument("--report-code", required=True)
+
     q = sub.add_parser("query", help="Query site history")
     q.add_argument("--code", required=True)
     q.add_argument("--type", required=True, choices=["SUMMARY", "LATEST", "FAILS", "TOP_ISSUES"])
@@ -108,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "summarize-report":
             out = report_svc.summarize_report_text(site_code=args.code, report_code=args.report_code)
+            print(out)
+            return 0
+
+        if args.cmd == "image-audit":
+            out = report_svc.image_audit(site_code=args.code, report_code=args.report_code)
             print(out)
             return 0
 

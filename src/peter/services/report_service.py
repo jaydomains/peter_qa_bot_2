@@ -21,6 +21,7 @@ from peter.parsing.pdf_text import extract_pdf_text, has_meaningful_text
 from peter.storage.filestore import ensure_site_folders
 from peter.util.hashing import sha256_file
 from peter.vision.openai_vision import VisionError, analyze_page_image
+from peter.vision.image_audit import audit_page_image, ImageAuditError
 
 
 class ReportService:
@@ -182,6 +183,63 @@ class ReportService:
                     parts.append(f"    • {ev}")
 
         return "\n".join(parts) + "\n"
+
+    def image_audit(self, *, site_code: str, report_code: str) -> str:
+        """Audit pages for photos/tables/labels. No defect inference."""
+
+        site_code = (site_code or "").strip().upper()
+        rc = self._validate_report_code(report_code)
+
+        site = self.site_repo.get_by_code(site_code)
+        if not site:
+            raise ValidationError(f"Unknown site_code: {site_code}")
+
+        row = self.conn.execute(
+            """
+            SELECT id, sha256, stored_path
+            FROM reports
+            WHERE site_id = ? AND report_code = ?
+            ORDER BY received_at DESC
+            LIMIT 1
+            """,
+            (site.id, rc),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Report not found for site={site_code} report_code={rc}")
+
+        sha = str(row["sha256"])
+        stored_rel = str(row["stored_path"])
+
+        sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+        pdf_path = (
+            sandbox.build_path(stored_rel.split("/", 1)[1])
+            if stored_rel.startswith("SITES/")
+            else (self.settings.QA_ROOT / stored_rel)
+        ).resolve()
+
+        pages_dir = sandbox.ensure_dir("03_reviews", f"{site.site_code}__{rc}__{sha[:12]}__pages")
+        rendered = render_pdf_pages(
+            pdf_path,
+            out_dir=pages_dir,
+            prefix=f"{site.site_code}__{rc}__{sha[:12]}",
+            dpi=300,
+        )
+
+        api_key = self.settings.OPENAI_API_KEY
+        model = os.getenv("PETER_VISION_MODEL", "gpt-4.1")
+
+        lines = [f"IMAGE AUDIT\nsite={site.site_code} report={rc} sha={sha}"]
+
+        for idx, img_path in enumerate(rendered.page_paths, start=1):
+            try:
+                a = audit_page_image(api_key=api_key, model=model, page_number=idx, image_path=img_path)
+                lines.append(
+                    f"- PDF page {a.pdf_page_number}: photos~{a.photo_count_estimate} table/form={a.has_table_or_form} labels={a.has_labels_or_callouts}"
+                )
+            except ImageAuditError as e:
+                lines.append(f"- PDF page {idx}: ERROR {str(e)[:160]}")
+
+        return "\n".join(lines) + "\n"
 
     def analyze_report_visuals(self, *, site_code: str, report_code: str, reset: bool = False) -> dict:
         """Run Vision across all pages and create blocking issues for visual omissions.
