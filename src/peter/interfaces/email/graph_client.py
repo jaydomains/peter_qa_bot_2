@@ -53,6 +53,10 @@ class GraphClient:
         out = self._req("GET", url)
         return out.get("value", []) or []
 
+    def get_attachment(self, *, mailbox: str, message_id: str, attachment_id: str) -> dict[str, Any]:
+        url = f"{self.base_url}/users/{urllib.parse.quote(mailbox)}/messages/{message_id}/attachments/{attachment_id}"
+        return self._req("GET", url)
+
     def create_reply_draft(self, *, mailbox: str, message_id: str) -> dict[str, Any]:
         url = f"{self.base_url}/users/{urllib.parse.quote(mailbox)}/messages/{message_id}/createReply"
         return self._req("POST", url, {})

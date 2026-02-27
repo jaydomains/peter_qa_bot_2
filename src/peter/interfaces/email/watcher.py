@@ -21,6 +21,7 @@ from peter.interfaces.email.recipient_policy import (
 from peter.services.site_service import SiteService
 from peter.services.spec_service import SpecService
 from peter.services.report_service import ReportService
+from peter.services.query_service import QueryService
 
 
 def _extract_addrs(msg: dict[str, Any], field: str) -> list[str]:
@@ -64,6 +65,7 @@ class EmailWatcher:
             site_svc = SiteService(conn, self.settings)
             spec_svc = SpecService(conn, self.settings)
             report_svc = ReportService(conn, self.settings)
+            query_svc = QueryService(conn, self.settings)
 
             msgs = graph.list_unread_messages(mailbox=self.settings.BOT_MAILBOX, top=10)
             for m in msgs:
@@ -105,12 +107,59 @@ class EmailWatcher:
                     if cmd.kind == "NEW_SITE" and cmd.site_code and cmd.arg:
                         site_svc.create_site(site_code=cmd.site_code, site_name=cmd.arg)
                         reply_text = f"OK created site {cmd.site_code}"
-                    elif cmd.kind == "SPEC_UPDATE":
-                        reply_text = "SPEC UPDATE received. (Attachment ingestion not implemented yet.)"
-                    elif cmd.kind == "QA_REPORT":
-                        reply_text = "QA REPORT received. (Attachment ingestion not implemented yet.)"
+
+                    elif cmd.kind in {"SPEC_UPDATE", "QA_REPORT"}:
+                        if not cmd.site_code:
+                            raise RuntimeError("Missing site_code")
+                        attachments = graph.list_attachments(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                        pdfs = [a for a in attachments if (a.get("contentType") or "").lower() == "application/pdf"]
+                        if not pdfs:
+                            reply_text = "No PDF attachment found."
+                        else:
+                            # take first pdf (tighten later)
+                            att_meta = pdfs[0]
+                            att = graph.get_attachment(
+                                mailbox=self.settings.BOT_MAILBOX,
+                                message_id=mid,
+                                attachment_id=att_meta["id"],
+                            )
+                            if att.get("@odata.type", "").endswith("fileAttachment") and att.get("contentBytes"):
+                                data = base64.b64decode(att["contentBytes"])
+                                name = att.get("name") or "attachment.pdf"
+                                # Write to a temp drop folder under data/ for ingestion
+                                drop = Path(self.settings.DATA_DIR) / "email_drop"
+                                drop.mkdir(parents=True, exist_ok=True)
+                                out_path = drop / f"{cmd.site_code}__{cmd.kind}__{mid}__{name}"
+                                out_path.write_bytes(data)
+
+                                if cmd.kind == "SPEC_UPDATE":
+                                    spec = spec_svc.ingest_spec(site_code=cmd.site_code, version_label=cmd.arg or "REV01", file_path=out_path)
+                                    reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
+                                else:
+                                    rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
+                                    out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
+                                    reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}"
+                            else:
+                                reply_text = "Attachment type unsupported (expected fileAttachment with contentBytes)."
+
                     elif cmd.kind == "QUERY":
-                        reply_text = "QUERY received. (Query via email not implemented yet.)"
+                        if not cmd.site_code or not cmd.arg:
+                            raise RuntimeError("QUERY missing site or command")
+                        q = cmd.arg.strip().upper()
+                        if q == "SUMMARY":
+                            reply_text = query_svc.summary(cmd.site_code, days=30)
+                        elif q == "LATEST":
+                            reply_text = query_svc.latest(cmd.site_code)
+                        elif q.startswith("FAILS"):
+                            parts = q.split()
+                            days = int(parts[1]) if len(parts) > 1 else 30
+                            reply_text = query_svc.fails(cmd.site_code, days=days)
+                        elif q.startswith("TOP ISSUES"):
+                            parts = q.split()
+                            days = int(parts[-1]) if parts[-1].isdigit() else 30
+                            reply_text = query_svc.top_issues(cmd.site_code, days=days)
+                        else:
+                            reply_text = "Unsupported QUERY. Use SUMMARY, LATEST, FAILS <NDAYS>, TOP ISSUES <NDAYS>"
                     else:
                         reply_text = "Unrecognized subject format. Expected: QA REPORT | <SITE_CODE> | R01"
                 except Exception as e:
