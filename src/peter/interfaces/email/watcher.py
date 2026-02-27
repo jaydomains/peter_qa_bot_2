@@ -142,67 +142,135 @@ class EmailWatcher:
                     elif cmd.kind in {"SPEC_UPDATE", "QA_REPORT"}:
                         if not cmd.site_code:
                             raise RuntimeError("Missing site_code")
+
+                        # Resolve site sandbox for quarantine/archival
+                        site = site_repo.get_by_code(cmd.site_code)
+                        if not site:
+                            raise RuntimeError(f"Unknown site_code: {cmd.site_code}")
+                        sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+
                         attachments = graph.list_attachments(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
-                        pdfs = [a for a in attachments if (a.get("contentType") or "").lower() == "application/pdf"]
-                        if not pdfs:
-                            reply_text = "No PDF attachment found."
-                        else:
-                            # take first pdf (tighten later)
-                            # Quarantine extras
-                            for extra in pdfs[1:]:
+
+                        # Download all fileAttachments with contentBytes (best-effort)
+                        downloaded: list[dict[str, Any]] = []
+                        for meta in attachments:
+                            att_id = meta.get("id")
+                            if not att_id:
+                                continue
+                            att = graph.get_attachment(
+                                mailbox=self.settings.BOT_MAILBOX,
+                                message_id=mid,
+                                attachment_id=att_id,
+                            )
+                            if not (att.get("@odata.type", "").endswith("fileAttachment") and att.get("contentBytes")):
+                                # Quarantine metadata-only attachments
                                 try:
                                     email_att_repo.insert(
                                         email_event_id=event_id,
-                                        filename=str(extra.get("name") or "extra.pdf"),
-                                        content_type=str(extra.get("contentType") or ""),
+                                        filename=str(att.get("name") or meta.get("name") or "attachment"),
+                                        content_type=str(att.get("contentType") or meta.get("contentType") or ""),
                                         sha256="".ljust(64, "0"),
                                         stored_path=None,
                                         quarantined=True,
                                     )
                                 except Exception:
                                     pass
+                                continue
 
-                            att_meta = pdfs[0]
-                            att = graph.get_attachment(
-                                mailbox=self.settings.BOT_MAILBOX,
-                                message_id=mid,
-                                attachment_id=att_meta["id"],
-                            )
-                            if att.get("@odata.type", "").endswith("fileAttachment") and att.get("contentBytes"):
-                                data = base64.b64decode(att["contentBytes"])
-                                name = att.get("name") or "attachment.pdf"
-                                sha = sha256_bytes(data)
+                            data = base64.b64decode(att["contentBytes"])
+                            name = str(att.get("name") or meta.get("name") or "attachment")
+                            ctype = str(att.get("contentType") or meta.get("contentType") or "")
+                            sha = sha256_bytes(data)
 
-                                # Write to a temp drop folder under data/ for ingestion (idempotent by sha)
-                                drop = Path(self.settings.DATA_DIR) / "email_drop"
-                                drop.mkdir(parents=True, exist_ok=True)
-                                safe_name = f"{cmd.site_code}__{cmd.kind}__{sha[:12]}__{name}".replace("/", "_")
-                                out_path = drop / safe_name
-                                if not out_path.exists():
-                                    out_path.write_bytes(data)
+                            downloaded.append({"name": name, "content_type": ctype, "sha": sha, "data": data})
+
+                        # Classify PDFs
+                        def _is_pdf(item: dict[str, Any]) -> bool:
+                            ctype = (item.get("content_type") or "").lower()
+                            name = (item.get("name") or "").lower()
+                            return ctype == "application/pdf" or name.endswith(".pdf")
+
+                        pdfs = [d for d in downloaded if _is_pdf(d)]
+                        others = [d for d in downloaded if not _is_pdf(d)]
+
+                        # Quarantine non-PDF attachments always
+                        for o in others:
+                            try:
+                                qname = f"{site.site_code}__EMAIL__{cmd.kind}__{mid}__{o['sha'][:12]}__{o['name']}".replace("/", "_")
+                                qpath = sandbox.build_path("99_quarantine", qname)
+                                qpath.write_bytes(o["data"])
+                                sandbox.build_path("99_quarantine", qname + ".reason.txt").write_text(
+                                    "Non-PDF email attachment quarantined.\n", encoding="utf-8"
+                                )
 
                                 email_att_repo.insert(
                                     email_event_id=event_id,
-                                    filename=name,
-                                    content_type=str(att.get("contentType") or ""),
-                                    sha256=sha,
-                                    stored_path=str(out_path),
-                                    quarantined=False,
+                                    filename=o["name"],
+                                    content_type=o["content_type"],
+                                    sha256=o["sha"],
+                                    stored_path=str(qpath.relative_to(self.settings.QA_ROOT)),
+                                    quarantined=True,
                                 )
+                            except Exception:
+                                pass
 
-                                if cmd.kind == "SPEC_UPDATE":
-                                    spec = spec_svc.ingest_spec(
-                                        site_code=cmd.site_code,
-                                        version_label=cmd.arg or "REV01",
-                                        file_path=out_path,
+                        # Enforce exactly one PDF for SPEC_UPDATE / QA_REPORT
+                        if len(pdfs) != 1:
+                            # Quarantine PDF(s) too, for manual review
+                            for p in pdfs:
+                                try:
+                                    qname = f"{site.site_code}__EMAIL__{cmd.kind}__{mid}__{p['sha'][:12]}__{p['name']}".replace("/", "_")
+                                    qpath = sandbox.build_path("99_quarantine", qname)
+                                    qpath.write_bytes(p["data"])
+                                    sandbox.build_path("99_quarantine", qname + ".reason.txt").write_text(
+                                        f"PDF attachment quarantined: expected exactly 1 PDF, got {len(pdfs)}.\n",
+                                        encoding="utf-8",
                                     )
-                                    reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
-                                else:
-                                    rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
-                                    out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
-                                    reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}"
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=p["name"],
+                                        content_type=p["content_type"],
+                                        sha256=p["sha"],
+                                        stored_path=str(qpath.relative_to(self.settings.QA_ROOT)),
+                                        quarantined=True,
+                                    )
+                                except Exception:
+                                    pass
+
+                            reply_text = f"ERROR: Expected exactly 1 PDF attachment for {cmd.kind}, got {len(pdfs)}. Attachments quarantined."
+
+                        else:
+                            # Exactly one PDF -> ingest
+                            p = pdfs[0]
+
+                            # Write to email_drop for ingestion (idempotent by sha)
+                            drop = Path(self.settings.DATA_DIR) / "email_drop"
+                            drop.mkdir(parents=True, exist_ok=True)
+                            safe_name = f"{cmd.site_code}__{cmd.kind}__{p['sha'][:12]}__{p['name']}".replace("/", "_")
+                            out_path = drop / safe_name
+                            if not out_path.exists():
+                                out_path.write_bytes(p["data"])
+
+                            email_att_repo.insert(
+                                email_event_id=event_id,
+                                filename=p["name"],
+                                content_type=p["content_type"],
+                                sha256=p["sha"],
+                                stored_path=str(out_path),
+                                quarantined=False,
+                            )
+
+                            if cmd.kind == "SPEC_UPDATE":
+                                spec = spec_svc.ingest_spec(
+                                    site_code=cmd.site_code,
+                                    version_label=cmd.arg or "REV01",
+                                    file_path=out_path,
+                                )
+                                reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
                             else:
-                                reply_text = "Attachment type unsupported (expected fileAttachment with contentBytes)."
+                                rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
+                                out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
+                                reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}"
 
                     elif cmd.kind == "QUERY":
                         if not cmd.site_code or not cmd.arg:
