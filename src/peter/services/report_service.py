@@ -158,7 +158,7 @@ class ReportService:
             try:
                 vr = analyze_page_image(api_key=api_key, model=model, page_number=idx, image_path=img_path)
             except VisionError as e:
-                vision_results.append({"page": idx, "error": str(e)})
+                vision_results.append({"page": idx, "error": str(e)[:2000]})
                 continue
 
             vision_results.append(

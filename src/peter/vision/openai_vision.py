@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,7 +95,10 @@ def analyze_page_image(
                 ],
             }
         ],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "vision_page_result", "schema": schema}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "vision_page_result", "schema": schema, "strict": True},
+        },
     }
 
     req = urllib.request.Request(
@@ -110,6 +114,13 @@ def analyze_page_image(
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        details = ""
+        try:
+            details = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = ""
+        raise VisionError(f"Vision request failed: HTTP {e.code} {e.reason} {details}".strip()) from e
     except Exception as e:
         raise VisionError(f"Vision request failed: {e}") from e
 
