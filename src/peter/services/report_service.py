@@ -61,11 +61,22 @@ class ReportService:
         sha = sha256_file(path)
         existing = self.report_repo.get_by_site_sha(site.id, sha)
         if existing:
+            # Best-effort locate extracted text file for user feedback
+            extracted_rel = None
+            try:
+                sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                txt_files = list(sandbox.build_path("00_admin").glob(f"{site.site_code}__REPORT__{rc}__{sha[:12]}*.txt"))
+                if txt_files:
+                    extracted_rel = str(txt_files[0].relative_to(self.settings.QA_ROOT))
+            except Exception:
+                extracted_rel = None
+
             return {
                 "status": "duplicate",
                 "report_id": existing.id,
                 "overall_result": existing.result,
                 "sha256": sha,
+                "extracted_text_path": extracted_rel,
             }
 
         safe_filename = f"{site.site_code}__REPORT__{rc}__{sha[:12]}.pdf"
