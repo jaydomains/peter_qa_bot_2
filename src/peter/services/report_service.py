@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 from peter.db.repositories.issue_repo import IssueRepository
+from peter.db.repositories.report_issue_repo import ReportIssueRepository
 from peter.db.repositories.report_repo import ReportRepository
 from peter.db.repositories.site_repo import SiteRepository
 from peter.domain.errors import ValidationError
@@ -34,6 +35,7 @@ class ReportService:
         self.site_repo = SiteRepository(conn)
         self.report_repo = ReportRepository(conn)
         self.issue_repo = IssueRepository(conn)
+        self.report_issue_repo = ReportIssueRepository(conn)
 
     def _validate_report_code(self, report_code: str) -> str:
         rc = (report_code or "").strip().upper().replace(" ", "")
@@ -101,7 +103,7 @@ class ReportService:
             "extracted_text_path": extracted_rel,
         }
 
-    def analyze_report_visuals(self, *, site_code: str, report_code: str) -> dict:
+    def analyze_report_visuals(self, *, site_code: str, report_code: str, reset: bool = False) -> dict:
         """Run Vision across all pages and create blocking issues for visual omissions.
 
         Policy: visual-only findings do NOT auto-fail; they set overall to WARN and create blocking issues.
@@ -129,6 +131,8 @@ class ReportService:
             raise ValidationError(f"Report not found for site={site_code} report_code={rc}")
 
         report_id = int(row["id"])
+        if reset:
+            self.report_issue_repo.delete_for_report(report_id)
         sha = str(row["sha256"])
         stored_rel = str(row["stored_path"])
 
@@ -195,6 +199,7 @@ class ReportService:
                 # 2) Non-visual blockers: tables/text indicating high-risk (e.g., moisture fails)
                 if basis == "PAGE_TEXT_OR_TABLE":
                     # If report text/table indicates moisture risk at HIGH/CRITICAL, create a blocking best-practice issue.
+                    # Tighten canonical: treat this category as moisture only; blistering etc are downstream risks.
                     if CanonicalDefect.DAMPNESS_MOULD_ALGAE in canonical and f.severity in ("HIGH", "CRITICAL") and high_conf:
                         evidence_blockers.append((idx, f))
 
@@ -236,9 +241,9 @@ class ReportService:
         if evidence_blockers:
             for page_num, finding in evidence_blockers:
                 sev = finding.severity
-                canon = ",".join(getattr(finding, "canonical_defects", []) or [])
+                # tighten canonical to moisture only
                 desc = (
-                    f"Best practice risk (PAGE_TEXT_OR_TABLE): canonical=[{canon}] indicates '{finding.defect}' (confidence={finding.confidence:.2f}). "
+                    f"Best practice risk (PAGE_TEXT_OR_TABLE): canonical=[DAMPNESS_MOULD_ALGAE] indicates '{finding.defect}' (confidence={finding.confidence:.2f}). "
                     f"Page {page_num}. Notes: {finding.notes}"
                 )
                 issue_id = self.issue_repo.insert(

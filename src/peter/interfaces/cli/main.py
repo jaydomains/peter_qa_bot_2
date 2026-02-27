@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     ar = sub.add_parser("analyze-report", help="Run visual verification on a report (Vision)")
     ar.add_argument("--code", required=True)
     ar.add_argument("--report-code", required=True)
+    ar.add_argument("--reset", action="store_true", help="Delete existing issues for this report before re-analysis")
 
     q = sub.add_parser("query", help="Query site history")
     q.add_argument("--code", required=True)
@@ -95,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "analyze-report":
-            out = report_svc.analyze_report_visuals(site_code=args.code, report_code=args.report_code)
+            out = report_svc.analyze_report_visuals(site_code=args.code, report_code=args.report_code, reset=bool(args.reset))
             print(
                 f"OK visual analysis: report_id={out['report_id']} omissions={len(out['omission_issues_created'])} vision_json={out['vision_json']}"
             )
