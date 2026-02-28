@@ -14,6 +14,7 @@ class AllowedProduct:
     raw_mention: str
     brand: str | None
     product: str
+    code: str | None
     kind: str  # PAINT|UNKNOWN
     aliases: list[str]
 
@@ -137,7 +138,7 @@ def extract_allowed_products(
         brand = "KANSAI PLASCON" if "KANSAI" in u else "PLASCON"
         product = f"{prod} ({code})".strip() if code else prod
 
-        out_det.append(AllowedProduct(raw_mention=u, brand=brand, product=product, kind="PAINT", aliases=[]))
+        out_det.append(AllowedProduct(raw_mention=u, brand=brand, product=product, code=(code or None), kind="PAINT", aliases=[]))
 
     # Deduplicate deterministic list
     seen2: set[tuple[str | None, str]] = set()
@@ -169,6 +170,7 @@ def extract_allowed_products(
                         "raw_mention": {"type": "string"},
                         "brand": {"type": ["string", "null"]},
                         "product": {"type": "string"},
+                        "code": {"type": ["string", "null"]},
                         "aliases": {"type": "array", "items": {"type": "string"}},
                     },
                 },
@@ -199,7 +201,7 @@ def extract_allowed_products(
     try:
         data = json.loads(raw)
     except Exception:
-        return [AllowedProduct(raw_mention=m, brand=None, product=m, kind="UNKNOWN", aliases=[]) for m in mentions]
+        return [AllowedProduct(raw_mention=m, brand=None, product=m, code=None, kind="UNKNOWN", aliases=[]) for m in mentions]
 
     out2: list[AllowedProduct] = []
     for it in (data.get("paint_products") or []):
@@ -216,7 +218,7 @@ def extract_allowed_products(
             for a in (it.get("aliases") or [])
             if _normalize_spaces(str(a))
         ]
-        out2.append(AllowedProduct(raw_mention=rm, brand=brand_s, product=prod, kind="PAINT", aliases=aliases))
+        out2.append(AllowedProduct(raw_mention=rm, brand=brand_s, product=prod, code=(str(it.get("code") or "").strip().upper() or None), kind="PAINT", aliases=aliases))
 
     # Merge deterministic + openai outputs (openai may normalize names)
     merged = uniq_det[:]

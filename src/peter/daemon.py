@@ -188,6 +188,42 @@ def run(*, cfg: DaemonConfig | None = None) -> int:
                     # Policy: email failures must not stop the daemon.
                     log.exception("EMAIL poll failed (continuing daemon loop)")
 
+            # Background TDS prefetch worker (best-effort)
+            try:
+                if os.getenv("PETER_TDS_PREFETCH_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+                    from peter.knowledge.tds_queue import list_items, update
+                    from peter.knowledge.tds_library import fetch_and_store_tds
+                    from peter.knowledge.tds_autosearch import autosearch_pdf_urls
+
+                    allowed_raw = os.getenv("PETER_TDS_ALLOWLIST", "")
+                    domains = [p.strip().lstrip("*.") for p in allowed_raw.split(",") if p.strip()]
+
+                    items = list_items(data_dir=settings.DATA_DIR, status="PENDING", limit=3)
+                    for it in items:
+                        vendor = str(it.payload.get("vendor") or "UNKNOWN")
+                        key = str(it.payload.get("product_key") or "UNKNOWN")
+
+                        # Autosearch is best-effort; if it fails, leave pending.
+                        urls = autosearch_pdf_urls(vendor=vendor, product_key=key, domains=domains)
+                        if not urls:
+                            update(item=it, patch={"status": "NEEDS_MANUAL_URL", "note": "No PDF found via autosearch"})
+                            continue
+
+                        last_err = None
+                        for url in urls[:3]:
+                            try:
+                                fetch_and_store_tds(qa_root=settings.QA_ROOT, vendor=vendor, product_key=key, url=url)
+                                update(item=it, patch={"status": "FETCHED", "url": url})
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = str(e)
+                                continue
+                        if last_err:
+                            update(item=it, patch={"status": "NEEDS_MANUAL_URL", "note": last_err})
+            except Exception:
+                log.exception("TDS prefetch worker failed")
+
             process_inbox_once(settings=settings)
             time.sleep(cfg.tick_seconds)
         except Exception:

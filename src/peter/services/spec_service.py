@@ -144,6 +144,26 @@ class SpecService:
                     + "\n",
                     encoding="utf-8",
                 )
+
+                # Background prefetch: enqueue TDS fetches for new products (by code if available).
+                try:
+                    from peter.knowledge.tds_queue import enqueue
+
+                    if os.getenv("PETER_TDS_PREFETCH_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+                        for pr in products:
+                            if pr.kind != "PAINT":
+                                continue
+                            product_key = (pr.code or pr.product).strip().upper()
+                            vendor = (pr.brand or "UNKNOWN").strip().upper()
+                            enqueue(
+                                data_dir=self.settings.DATA_DIR,
+                                vendor=vendor,
+                                product_key=product_key,
+                                hints={"site": site.site_code, "spec_version": vlabel},
+                            )
+                except Exception:
+                    pass
+
             except Exception:
                 pass
         except PdfTextExtractionError:
