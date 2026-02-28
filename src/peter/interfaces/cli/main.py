@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     ia.add_argument("--report-code", required=True)
 
     sub.add_parser("daemon", help="Run long-lived service loop")
+    sub.add_parser("inbox-once", help="Process filesystem INBOX once and exit")
 
     ep = sub.add_parser("email-poll", help="Run Microsoft Graph inbox poll loop (Phase 2)")
 
@@ -128,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
             from peter.daemon import run as daemon_run
 
             return int(daemon_run())
+
+        if args.cmd == "inbox-once":
+            from peter.daemon import process_inbox_once
+
+            settings.ensure_paths_exist()
+            process_inbox_once(settings=settings)
+            print("OK inbox processed")
+            return 0
 
         if args.cmd == "email-poll":
             from peter.interfaces.email.watcher import main as email_main

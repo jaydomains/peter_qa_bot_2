@@ -40,7 +40,7 @@ def _safe_move(src: Path, dest: Path) -> None:
     src.rename(dest)
 
 
-def _process_inbox_once(*, settings: Settings) -> None:
+def process_inbox_once(*, settings: Settings) -> None:
     """Process any PDFs dropped into data/INBOX.
 
     Layout (Option 2):
@@ -131,7 +131,7 @@ def run(*, cfg: DaemonConfig | None = None) -> int:
 
     while not _Stop.requested:
         try:
-            _process_inbox_once(settings=settings)
+            process_inbox_once(settings=settings)
             time.sleep(cfg.tick_seconds)
         except Exception:
             log.exception("Unhandled error in daemon loop; retrying in %.1fs", cfg.crash_backoff_seconds)
