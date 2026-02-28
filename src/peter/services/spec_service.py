@@ -31,10 +31,18 @@ class SpecService:
 
     def _validate_version(self, version_label: str) -> str:
         v = (version_label or "").strip().upper().replace(" ", "")
-        # Accept REV01, REV1, REVA, etc (tighten later if needed)
-        if not re.fullmatch(r"REV[0-9A-Z]{1,8}", v):
-            raise ValidationError("version_label must look like REV01 / REV1 / REVA")
-        return v
+
+        # Accept both REV* and V* forms and normalize to REV*.
+        # Examples: V1 -> REV1, V01 -> REV01
+        m_v = re.fullmatch(r"V([0-9A-Z]{1,8})", v)
+        if m_v:
+            return "REV" + m_v.group(1)
+
+        # Accept REV01, REV1, REVA, etc
+        if re.fullmatch(r"REV[0-9A-Z]{1,8}", v):
+            return v
+
+        raise ValidationError("version_label must look like V1 / REV01 / REV1 / REVA")
 
     def ingest_spec(self, *, site_code: str, version_label: str, file_path: Path) -> SpecRow:
         site_code = (site_code or "").strip().upper()
