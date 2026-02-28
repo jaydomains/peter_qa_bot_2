@@ -521,7 +521,30 @@ class EmailWatcher:
                             else:
                                 rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
                                 out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
-                                reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}"
+
+                                # Always (re)triage so the reply reflects the latest deterministic issues/result.
+                                try:
+                                    report_svc.triage_report_text(site_code=cmd.site_code, report_code=rc, reset=True)
+                                except Exception:
+                                    pass
+
+                                # Compose an operational reply (grounded + explicit recommendations)
+                                try:
+                                    from peter.interfaces.qa.ask import answer_report_question
+
+                                    reply_text = answer_report_question(
+                                        conn=conn,
+                                        settings=self.settings,
+                                        site_code=cmd.site_code,
+                                        report_code=rc,
+                                        question=(
+                                            "Summarize the QA status for this report and list required next actions to address blocking issues. "
+                                            "Be concise and use bullets where helpful."
+                                        ),
+                                        mode="recommend",
+                                    )
+                                except Exception:
+                                    reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}"
 
                     elif cmd.kind == "QUERY":
                         if not cmd.site_code or not cmd.arg:
@@ -560,6 +583,32 @@ class EmailWatcher:
                 # Create reply draft (this preserves in-thread metadata + quoted original)
                 draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
                 draft_id = draft["id"]
+
+                # Update subject to include a result tag.
+                try:
+                    # Best-effort: infer result tag from DB.
+                    row = conn.execute(
+                        """
+                        SELECT r.result
+                        FROM reports r
+                        JOIN sites s ON s.id = r.site_id
+                        WHERE s.site_code = ? AND r.report_code = ?
+                        ORDER BY r.received_at DESC
+                        LIMIT 1
+                        """,
+                        ((cmd.site_code or "").strip().upper(), (cmd.arg or "").strip().upper().replace(" ", "")),
+                    ).fetchone()
+                    res = (str(row["result"]) if row and row["result"] else "PENDING").upper()
+                    tag = f"[PETER: {res}]"
+                    subj = (subject or "").strip()
+                    if tag not in subj:
+                        graph.update_message(
+                            mailbox=self.settings.BOT_MAILBOX,
+                            message_id=draft_id,
+                            payload={"subject": f"{subj} {tag}".strip()},
+                        )
+                except Exception:
+                    pass
 
                 # Preserve the quoted original body by prepending our reply content
                 # instead of overwriting the entire body.
