@@ -6,6 +6,7 @@ from peter.config.settings import Settings
 
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,9 @@ from peter.storage.filestore import ensure_site_folders
 from peter.util.hashing import sha256_file
 from peter.vision.openai_vision import VisionError, analyze_page_image
 from peter.vision.image_audit import audit_page_image, ImageAuditError
+
+
+log = logging.getLogger("peter.report_service")
 
 
 class ReportService:
@@ -60,6 +64,43 @@ class ReportService:
         if re.fullmatch(r"\d{2,3}", rc):
             return rc
         raise ValidationError("report_code must look like R01 / R12 / 002")
+
+    def _template_extract_site_and_ref(self, text: str) -> tuple[str | None, str | None]:
+        """Best-effort extraction of site code + inspection reference from report text.
+
+        This is used to validate that a dropped/emailed PDF matches the expected
+        site/ref (helps catch misfiled attachments).
+
+        Expected template labels (case-insensitive):
+          - SITE CODE:
+          - INSPECTION REFERENCE:  (or REPORT # / REPORT NO)
+
+        Returns: (site_code, ref) or (None, None) if not found.
+        """
+
+        raw = (text or "")
+        if not raw.strip():
+            return None, None
+
+        # Normalize whitespace to make regex less brittle.
+        norm = re.sub(r"[\t\r]+", " ", raw)
+
+        m_site = re.search(r"(?im)^\s*SITE\s*CODE\s*:\s*([A-Z0-9_-]{3,20})\b", norm)
+        site = m_site.group(1).strip().upper() if m_site else None
+
+        # Try multiple labels for the report identifier.
+        m_ref = re.search(
+            r"(?im)^\s*(?:INSPECTION\s*REFERENCE|REPORT\s*#|REPORT\s*NO\.?|REPORT\s*NUMBER)\s*:\s*([^\n]+)",
+            norm,
+        )
+        ref = None
+        if m_ref:
+            ref_raw = m_ref.group(1).strip().upper()
+            # Common format: "PRSVNQA - 002" → keep just the numeric part for matching.
+            m_num = re.search(r"\b(\d{2,3})\b", ref_raw)
+            ref = m_num.group(1) if m_num else ref_raw.replace(" ", "")
+
+        return site, ref
 
     def ingest_report(self, *, site_code: str, report_code: str, file_path: Path) -> dict:
         site_code = (site_code or "").strip().upper()
@@ -106,6 +147,23 @@ class ReportService:
         meaningful = has_meaningful_text(text)
         extracted_rel = None
         if meaningful:
+            # Optional template validation (warn by default; strict if env is set).
+            mode = os.getenv("PETER_VALIDATE_REPORT_TEMPLATE", "").strip().lower()
+            if mode in ("1", "true", "warn", "strict"):
+                extracted_site, extracted_ref = self._template_extract_site_and_ref(text)
+
+                mismatches: list[str] = []
+                if extracted_site and extracted_site != site.site_code:
+                    mismatches.append(f"site_code_in_pdf={extracted_site} expected={site.site_code}")
+                if extracted_ref and extracted_ref != rc:
+                    mismatches.append(f"ref_in_pdf={extracted_ref} expected={rc}")
+
+                if mismatches:
+                    msg = "Report template fields mismatch: " + "; ".join(mismatches)
+                    if mode == "strict":
+                        raise ValidationError(msg)
+                    log.warning(msg)
+
             txt_name = f"{site.site_code}__REPORT__{rc}__{sha[:12]}.txt"
             txt_path = sandbox.build_path("00_admin", txt_name)
             txt_path.write_text(text, encoding="utf-8")
