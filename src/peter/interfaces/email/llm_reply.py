@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
+import re
 
 from peter.config.settings import Settings
 from peter.domain.errors import ValidationError
@@ -27,8 +28,18 @@ def _build_evidence_pack(
     vision_text: str,
 ) -> EvidencePack:
     sc = (site_code or "").strip().upper()
-    rc = (report_code or "").strip().upper().replace(" ", "")
+    rc_in = (report_code or "").strip().upper().replace(" ", "")
 
+    # Normalize report_code so R001 and 001 refer to the same logical report when applicable.
+    rc = rc_in
+    try:
+        from peter.services.report_service import ReportService
+
+        rc = ReportService(conn, settings)._validate_report_code(rc_in)
+    except Exception:
+        rc = rc_in
+
+    # Try exact match first; then fall back between R### and ### forms.
     row = conn.execute(
         """
         SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result
@@ -40,6 +51,25 @@ def _build_evidence_pack(
         """,
         (sc, rc),
     ).fetchone()
+
+    if not row:
+        alt = None
+        if re.fullmatch(r"R\d{2,3}", rc):
+            alt = rc[1:].zfill(3)
+        elif re.fullmatch(r"\d{2,3}", rc):
+            alt = "R" + rc.zfill(3)
+        if alt:
+            row = conn.execute(
+                """
+                SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result
+                FROM reports r
+                JOIN sites s ON s.id = r.site_id
+                WHERE s.site_code = ? AND r.report_code = ?
+                ORDER BY r.received_at DESC
+                LIMIT 1
+                """,
+                (sc, alt),
+            ).fetchone()
     if not row:
         raise ValidationError(f"Report not found for site={sc} report_code={rc}")
 
