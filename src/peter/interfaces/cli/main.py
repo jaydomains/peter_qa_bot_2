@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--report-code", required=True)
     tr.add_argument("--reset", action="store_true", help="Delete existing issues for this report before triage")
 
+    dr = sub.add_parser("demo-report", help="One-shot demo output: summary + flags + top issues")
+    dr.add_argument("--code", required=True)
+    dr.add_argument("--report-code", required=True)
+    dr.add_argument("--days", type=int, default=365)
+
     ia = sub.add_parser("image-audit", help="Audit report pages for photo/table/labels (no defect inference)")
     ia.add_argument("--code", required=True)
     ia.add_argument("--report-code", required=True)
@@ -128,6 +133,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "triage-report":
             out = report_svc.triage_report_text(site_code=args.code, report_code=args.report_code, reset=bool(args.reset))
             print(out)
+            return 0
+
+        if args.cmd == "demo-report":
+            site_code = (args.code or "").strip().upper()
+            report_code = (args.report_code or "").strip()
+
+            # Show latest stored report row (result + stored path).
+            row = conn.execute(
+                """
+                SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result
+                FROM reports r
+                JOIN sites s ON s.id = r.site_id
+                WHERE s.site_code = ? AND r.report_code = ?
+                ORDER BY r.received_at DESC
+                LIMIT 1
+                """,
+                (site_code, report_code),
+            ).fetchone()
+
+            if not row:
+                raise SystemExit(f"Report not found for site={site_code} report_code={report_code}")
+
+            print(
+                "DEMO REPORT\n"
+                f"site={site_code} report={report_code} report_id={int(row['id'])}\n"
+                f"received_at={row['received_at']} result={row['result']}\n"
+                f"stored_path={row['stored_path']}\n"
+                f"sha256={row['sha256']}\n"
+            )
+
+            # Summary + deterministic flags
+            print(report_svc.summarize_report_text(site_code=site_code, report_code=report_code))
+
+            # Top issues (requires triage/analysis to have populated issues)
+            print(query_svc.top_issues(site_code, days=int(args.days)))
             return 0
 
         if args.cmd == "image-audit":

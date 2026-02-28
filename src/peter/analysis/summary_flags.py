@@ -11,11 +11,42 @@ class Flag:
     evidence: list[str]
 
 
-def _evidence_lines(text: str, pattern: re.Pattern[str], *, max_lines: int = 5) -> list[str]:
+def _iter_sentences(text: str) -> list[str]:
+    """Very lightweight sentence splitter.
+
+    We prefer shorter, human-readable evidence in summaries; splitting into
+    sentences produces cleaner snippets than matching arbitrary PDF-extracted
+    line fragments.
+    """
+
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    # Normalize whitespace and keep newlines as potential boundaries.
+    t = re.sub(r"[\t\r]+", " ", t)
+
+    # Split on sentence-ish boundaries or line breaks.
+    parts = re.split(r"(?<=[.!?])\s+|\n+", t)
+    out: list[str] = []
+    for p in parts:
+        s = re.sub(r"\s+", " ", (p or "").strip())
+        if not s:
+            continue
+        # Drop table-like / noisy fragments.
+        if len(s) > 260:
+            continue
+        if s.count("\t") >= 2:
+            continue
+        out.append(s)
+    return out
+
+
+def _evidence_lines(text: str, pattern: re.Pattern[str], *, max_lines: int = 3) -> list[str]:
     ev: list[str] = []
-    for line in (text or "").splitlines():
-        if pattern.search(line):
-            ev.append(line.strip())
+    for sent in _iter_sentences(text):
+        if pattern.search(sent):
+            ev.append(sent)
             if len(ev) >= max_lines:
                 break
     return ev
