@@ -16,6 +16,15 @@ class SiteService:
         self.settings = settings
         self.repo = SiteRepository(conn)
 
+    def get_site_or_raise(self, site_code: str) -> Site:
+        code = validate_site_code(site_code)
+        site = self.repo.get_by_code(code)
+        if not site:
+            raise ValidationError(f"Unknown site_code: {code} (create it first)")
+        # Ensure folders exist (useful if created in an older version)
+        ensure_site_folders(self.settings, folder_name=site.folder_name)
+        return site
+
     def create_site(self, *, site_code: str, site_name: str, address: str = "") -> Site:
         code = validate_site_code(site_code)
         name = (site_name or "").strip()
