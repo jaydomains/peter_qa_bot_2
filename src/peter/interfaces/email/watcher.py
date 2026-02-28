@@ -898,6 +898,13 @@ class EmailWatcher:
                                 + vision_note
                                 + "\n"
                             )
+
+                    elif cmd.kind == "ASSIST":
+                        if not cmd.site_code or not cmd.arg:
+                            raise RuntimeError("ASSIST missing site or request")
+                        from peter.interfaces.email.assist import run_assist
+
+                        reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=cmd.arg)
                     else:
                         # If subject is not recognized, do NOT send any email.
                         # We will attempt attachment-driven inference for a single PDF.

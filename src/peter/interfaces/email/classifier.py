@@ -19,6 +19,7 @@ def parse_subject(subject: str) -> ParsedCommand:
       QA REPORT | <SITE_CODE> | <RXX>
       QUERY | <SITE_CODE> | <COMMAND>
       REPLY | <SITE_CODE> | <REPORT_REF>
+      ASSIST | <SITE_CODE> | <FREEFORM REQUEST>
     """
 
     s = (subject or "").strip()
@@ -27,13 +28,14 @@ def parse_subject(subject: str) -> ParsedCommand:
         return ParsedCommand("UNKNOWN", None, None)
 
     cmd = parts[0].upper()
-    if cmd in {"NEW SITE", "SPEC UPDATE", "QA REPORT", "QUERY", "REPLY"} and len(parts) >= 3:
+    if cmd in {"NEW SITE", "SPEC UPDATE", "QA REPORT", "QUERY", "REPLY", "ASSIST"} and len(parts) >= 3:
         kind = {
             "NEW SITE": "NEW_SITE",
             "SPEC UPDATE": "SPEC_UPDATE",
             "QA REPORT": "QA_REPORT",
             "QUERY": "QUERY",
             "REPLY": "REPLY",
+            "ASSIST": "ASSIST",
         }[cmd]
         site_code = parts[1].upper()
         arg = "|".join(parts[2:]).strip()
