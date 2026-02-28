@@ -614,10 +614,22 @@ class EmailWatcher:
                                     f"File saved: {str(item.file_path)}\n"
                                 )
 
+                            out_path: Path | None = None
+
                             # If we set a QUARANTINED reply, skip ingest.
                             if reply_text.startswith("QUARANTINED"):
-                                # proceed to reply send path
-                                pass
+                                # Record the quarantined attachment location for audit
+                                try:
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=p["name"],
+                                        content_type=p["content_type"],
+                                        sha256=p["sha"],
+                                        stored_path=str(item.file_path) if "item" in locals() else None,
+                                        quarantined=True,
+                                    )
+                                except Exception:
+                                    pass
                             else:
                                 # Write to email_drop for ingestion (idempotent by sha)
                                 drop = Path(self.settings.DATA_DIR) / "email_drop"
@@ -627,25 +639,25 @@ class EmailWatcher:
                                 if not out_path.exists():
                                     out_path.write_bytes(p["data"])
 
-                            email_att_repo.insert(
-                                email_event_id=event_id,
-                                filename=p["name"],
-                                content_type=p["content_type"],
-                                sha256=p["sha"],
-                                stored_path=str(out_path),
-                                quarantined=False,
-                            )
-
-                            if cmd.kind == "SPEC_UPDATE":
-                                spec = spec_svc.ingest_spec(
-                                    site_code=cmd.site_code,
-                                    version_label=cmd.arg or "REV01",
-                                    file_path=out_path,
+                                email_att_repo.insert(
+                                    email_event_id=event_id,
+                                    filename=p["name"],
+                                    content_type=p["content_type"],
+                                    sha256=p["sha"],
+                                    stored_path=str(out_path),
+                                    quarantined=False,
                                 )
-                                reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
-                            else:
-                                rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
-                                out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
+
+                                if cmd.kind == "SPEC_UPDATE":
+                                    spec = spec_svc.ingest_spec(
+                                        site_code=cmd.site_code,
+                                        version_label=cmd.arg or "REV01",
+                                        file_path=out_path,
+                                    )
+                                    reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
+                                else:
+                                    rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
+                                    out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
 
                                 # Always (re)triage so the reply reflects the latest deterministic issues/result.
                                 try:
