@@ -32,13 +32,16 @@ def build_sanitized_reply_recipients(
     original_cc: list[str],
     bot_mailbox: str,
     forced_cc: list[str],
+    max_recipients: int = 10,
 ) -> Tuple[list[str], list[str]]:
     """Build internal-only recipients for in-thread reply.
 
-    Policy:
+    Updated safety policy (2026-02):
     - NEVER email external domains.
-    - Prefer replying to internal sender if internal.
-    - Always CC forced internal list.
+    - NEVER "reply-all" to the original internal To/Cc list (prevents wide internal blasts).
+    - To: internal sender only (if internal).
+    - Cc: forced internal list only.
+    - Hard cap total recipients as a fuse.
     """
 
     bot = _norm(bot_mailbox)
@@ -49,11 +52,6 @@ def build_sanitized_reply_recipients(
     if is_internal(original_from, internal_domain) and _norm(original_from) != bot:
         to_candidates.append(original_from)
 
-    for a in (original_to or []) + (original_cc or []):
-        a = _norm(a)
-        if a and a != bot and is_internal(a, internal_domain):
-            cc_candidates.append(a)
-
     for a in forced_cc or []:
         a = _norm(a)
         if a and a != bot and is_internal(a, internal_domain):
@@ -63,9 +61,16 @@ def build_sanitized_reply_recipients(
     cc_list = [a for a in dedupe(cc_candidates) if a not in set(to_list)]
 
     if not to_list:
-        # If sender is external, fall back to internal list as To.
+        # If sender is external, send only to forced internal list.
         to_list = cc_list[:]
         cc_list = []
+
+    # Fuse: cap total recipients
+    total = len(to_list) + len(cc_list)
+    if total > max_recipients:
+        # Trim CC first; keep To intact.
+        room = max_recipients - len(to_list)
+        cc_list = cc_list[: max(0, room)]
 
     return to_list, cc_list
 

@@ -27,6 +27,48 @@ from peter.services.report_service import ReportService
 from peter.services.query_service import QueryService
 
 
+def _infer_site_and_ref_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str | None, str | None]:
+    """Best-effort infer (site_code, report_ref) from the PDF content.
+
+    We rely on your standardized template labels (e.g. "SITE CODE:", "REPORT #:").
+    """
+
+    try:
+        import re
+        import tempfile
+        from pathlib import Path
+
+        from peter.parsing.pdf_text import extract_pdf_text, has_meaningful_text
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "attachment.pdf"
+            p.write_bytes(pdf_bytes)
+            text = extract_pdf_text(p)
+
+        if not has_meaningful_text(text):
+            return None, None
+
+        # Normalize whitespace
+        norm = re.sub(r"[\t\r]+", " ", text)
+
+        m_site = re.search(r"(?im)^\s*SITE\s*CODE\s*:\s*([A-Z0-9_-]{3,20})\b", norm)
+        site = m_site.group(1).strip().upper() if m_site else None
+
+        m_ref = re.search(
+            r"(?im)^\s*(?:INSPECTION\s*REFERENCE|REPORT\s*#|REPORT\s*NO\.?|REPORT\s*NUMBER)\s*:\s*([^\n]+)",
+            norm,
+        )
+        ref = None
+        if m_ref:
+            ref_raw = m_ref.group(1).strip().upper()
+            m_num = re.search(r"\b(\d{2,3})\b", ref_raw)
+            ref = (m_num.group(1) if m_num else ref_raw.replace(" ", "")).strip().upper()
+
+        return site, ref
+    except Exception:
+        return None, None
+
+
 def _extract_addrs(msg: dict[str, Any], field: str) -> list[str]:
     out: list[str] = []
     for x in msg.get(field, []) or []:
@@ -84,6 +126,34 @@ class EmailWatcher:
                 subject = (m.get("subject") or "").strip()
                 cmd = parse_subject(subject)
 
+                # If subject is not recognized, attempt attachment-driven inference
+                # for the common workflow: technicians CC the bot on existing threads.
+                if cmd.kind == "UNKNOWN":
+                    try:
+                        atts = graph.list_attachments(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                        pdf_candidates: list[bytes] = []
+                        for meta in atts or []:
+                            att_id = meta.get("id")
+                            if not att_id:
+                                continue
+                            att = graph.get_attachment(mailbox=self.settings.BOT_MAILBOX, message_id=mid, attachment_id=att_id)
+                            if not (att.get("@odata.type", "").endswith("fileAttachment") and att.get("contentBytes")):
+                                continue
+                            name = str(att.get("name") or meta.get("name") or "").lower()
+                            ctype = str(att.get("contentType") or meta.get("contentType") or "").lower()
+                            if ctype == "application/pdf" or name.endswith(".pdf"):
+                                pdf_candidates.append(base64.b64decode(att["contentBytes"]))
+
+                        if len(pdf_candidates) == 1:
+                            site_guess, ref_guess = _infer_site_and_ref_from_pdf_bytes(pdf_candidates[0])
+                            if site_guess and ref_guess:
+                                from peter.interfaces.email.classifier import ParsedCommand
+
+                                cmd = ParsedCommand("QA_REPORT", site_guess, ref_guess)
+                    except Exception:
+                        # Keep UNKNOWN if anything fails.
+                        pass
+
                 from_addr = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
                 to_addrs = _extract_addrs(m, "toRecipients")
                 cc_addrs = _extract_addrs(m, "ccRecipients")
@@ -134,6 +204,7 @@ class EmailWatcher:
 
                 # Build internal-only reply content
                 reply_text = ""
+                should_send = True
                 try:
                     if cmd.kind == "NEW_SITE" and cmd.site_code and cmd.arg:
                         site_svc.create_site(site_code=cmd.site_code, site_name=cmd.arg)
@@ -291,9 +362,20 @@ class EmailWatcher:
                         else:
                             reply_text = "Unsupported QUERY. Use SUMMARY, LATEST, FAILS <NDAYS>, TOP ISSUES <NDAYS>"
                     else:
-                        reply_text = "Unrecognized subject format. Expected: QA REPORT | <SITE_CODE> | R01"
+                        # If subject is not recognized, do NOT send any email.
+                        # We will attempt attachment-driven inference for a single PDF.
+                        should_send = False
+                        reply_text = "IGNORED: Unrecognized subject format (no reply sent)."
                 except Exception as e:
                     reply_text = f"ERROR: {e}"
+
+                if not should_send:
+                    # Still mark read to avoid loops.
+                    try:
+                        graph.mark_read(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                    except Exception:
+                        pass
+                    continue
 
                 # Create reply draft
                 draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
