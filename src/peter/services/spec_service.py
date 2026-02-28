@@ -63,7 +63,39 @@ class SpecService:
         sha = sha256_file(path)
         existing = self.spec_repo.get_by_site_sha(site.id, sha)
         if existing:
-            # idempotent: ensure active spec points at this if requested
+            # idempotent: ensure derived artifacts exist (best-effort)
+            try:
+                # If extracted text exists (or can be regenerated), ensure product allowlist exists.
+                from peter.knowledge.spec_products import extract_allowed_products
+
+                sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                txt_name_glob = f"{site.site_code}__SPEC__{vlabel}__{sha[:12]}*.txt"
+                txt_files = list(sandbox.build_path("00_admin").glob(txt_name_glob))
+                spec_text = txt_files[0].read_text(encoding="utf-8", errors="replace") if txt_files else ""
+
+                products_name = f"{site.site_code}__PRODUCTS__{vlabel}__{sha[:12]}.json"
+                products_path = sandbox.build_path("00_admin", products_name)
+                if spec_text and not products_path.exists():
+                    use_openai = os.getenv("PETER_SPEC_PRODUCTS_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
+                    model = os.getenv("PETER_SPEC_PRODUCTS_MODEL", "gpt-4.1")
+                    products = extract_allowed_products(spec_text=spec_text, use_openai=use_openai, model=model)
+                    products_path.write_text(
+                        json.dumps(
+                            {
+                                "site_code": site.site_code,
+                                "version": vlabel,
+                                "sha256": sha,
+                                "paint_products": [p.__dict__ for p in products if p.kind == "PAINT"],
+                                "notes": "Generated from spec text; strict allowlist (paint only).",
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
             return existing
 
         # Store PDF under 01_spec with enforced naming
