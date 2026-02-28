@@ -900,11 +900,25 @@ class EmailWatcher:
                             )
 
                     elif cmd.kind == "ASSIST":
-                        if not cmd.site_code or not cmd.arg:
-                            raise RuntimeError("ASSIST missing site or request")
+                        if not cmd.site_code:
+                            raise RuntimeError("ASSIST missing site")
                         from peter.interfaces.email.assist import run_assist
 
-                        reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=cmd.arg)
+                        # Prefer message body as the freeform request; fall back to subject arg.
+                        req = (cmd.arg or "").strip()
+                        try:
+                            full = graph.get_message(mailbox=self.settings.BOT_MAILBOX, message_id=mid, select="body")
+                            body = (full.get("body") or {}).get("content") or ""
+                            body_req = str(body).strip()
+                            if body_req:
+                                req = body_req
+                        except Exception:
+                            pass
+
+                        if not req:
+                            raise RuntimeError("ASSIST missing request (empty body and no subject arg)")
+
+                        reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
                     else:
                         # If subject is not recognized, do NOT send any email.
                         # We will attempt attachment-driven inference for a single PDF.
