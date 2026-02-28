@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import base64
 import time
+import os
+import re
+import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +24,95 @@ from peter.db.repositories.site_repo import SiteRepository
 from peter.interfaces.email.classifier import parse_subject
 from peter.interfaces.email.graph_auth import client_credentials_token
 from peter.interfaces.email.graph_client import GraphClient
+
+
+def _hosts_allowed() -> list[str]:
+    raw = os.getenv(
+        "PETER_LINK_ALLOWLIST",
+        "fieldwire.com,*.fieldwire.com,sharepoint.com,*.sharepoint.com,1drv.ms,onedrive.live.com,drive.google.com",
+    )
+    return [h.strip().lower() for h in raw.split(",") if h.strip()]
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    host = (host or "").lower().strip(".")
+    pattern = (pattern or "").lower().strip(".")
+    if not host or not pattern:
+        return False
+    if pattern.startswith("*."):
+        return host == pattern[2:] or host.endswith("." + pattern[2:])
+    return host == pattern or host.endswith("." + pattern)
+
+
+def _is_allowed_url(url: str) -> bool:
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = (p.hostname or "").lower()
+        if not host:
+            return False
+        for pat in _hosts_allowed():
+            if _host_matches(host, pat):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _extract_urls_from_body(body: dict[str, Any] | None) -> list[str]:
+    if not body:
+        return []
+    content = str(body.get("content") or "")
+    if not content.strip():
+        return []
+
+    # Very simple URL extraction; good enough to start.
+    urls = re.findall(r"https?://[^\s\)\]\>\"']+", content, flags=re.I)
+    # Trim common trailing punctuation
+    cleaned: list[str] = []
+    for u in urls:
+        u2 = u.rstrip(".,;:)")
+        if u2:
+            cleaned.append(u2)
+    # Dedupe preserving order
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in cleaned:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _download_url_limited(url: str, *, max_bytes: int) -> bytes:
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "PETER-QA/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise RuntimeError(f"Download exceeded limit ({max_bytes} bytes)")
+    return data
+
+
+def _looks_like_pdf(data: bytes) -> bool:
+    return (data or b"").startswith(b"%PDF-")
+
+
+def _looks_like_zip(data: bytes) -> bool:
+    return (data or b"").startswith(b"PK\x03\x04")
+
+
+def _extract_pdfs_from_zip_bytes(zbytes: bytes) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:  # type: ignore[name-defined]
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            if name.lower().endswith(".pdf"):
+                out.append((name, zf.read(info)))
+    return out
 
 
 def _escape_html(s: str) -> str:
@@ -267,14 +363,42 @@ class EmailWatcher:
 
                             downloaded.append({"name": name, "content_type": ctype, "sha": sha, "data": data})
 
-                        # Classify PDFs
+                        # Classify PDFs / ZIPs
                         def _is_pdf(item: dict[str, Any]) -> bool:
                             ctype = (item.get("content_type") or "").lower()
                             name = (item.get("name") or "").lower()
                             return ctype == "application/pdf" or name.endswith(".pdf")
 
+                        def _is_zip(item: dict[str, Any]) -> bool:
+                            ctype = (item.get("content_type") or "").lower()
+                            name = (item.get("name") or "").lower()
+                            return ctype in ("application/zip", "application/x-zip-compressed") or name.endswith(".zip")
+
                         pdfs = [d for d in downloaded if _is_pdf(d)]
-                        others = [d for d in downloaded if not _is_pdf(d)]
+                        zips = [d for d in downloaded if _is_zip(d)]
+                        others = [d for d in downloaded if (d not in pdfs and d not in zips)]
+
+                        # If no PDFs but a single ZIP is present, extract PDFs from ZIP.
+                        if not pdfs and len(zips) == 1:
+                            try:
+                                z = zips[0]
+                                extracted = []
+                                with zipfile.ZipFile(io.BytesIO(z["data"])) as zf:
+                                    for info in zf.infolist():
+                                        if info.is_dir():
+                                            continue
+                                        if info.filename.lower().endswith(".pdf"):
+                                            extracted.append(
+                                                {
+                                                    "name": info.filename,
+                                                    "content_type": "application/pdf",
+                                                    "sha": sha256_bytes(zf.read(info)),
+                                                    "data": zf.read(info),
+                                                }
+                                            )
+                                pdfs = extracted
+                            except Exception:
+                                pdfs = []
 
                         # Quarantine non-PDF attachments always
                         for o in others:
@@ -294,6 +418,50 @@ class EmailWatcher:
                                     stored_path=str(qpath.relative_to(self.settings.QA_ROOT)),
                                     quarantined=True,
                                 )
+                            except Exception:
+                                pass
+
+                        # If still no PDFs, attempt link-based fetch from the email body.
+                        if not pdfs:
+                            try:
+                                max_mb = int(os.getenv("PETER_LINK_MAX_MB", "80"))
+                                max_bytes = max_mb * 1024 * 1024
+                                full = graph.get_message(mailbox=self.settings.BOT_MAILBOX, message_id=mid, select="body")
+                                urls = _extract_urls_from_body(full.get("body"))
+                                for url in urls:
+                                    if not _is_allowed_url(url):
+                                        continue
+                                    data = _download_url_limited(url, max_bytes=max_bytes)
+                                    if _looks_like_pdf(data):
+                                        pdfs = [
+                                            {
+                                                "name": Path(urllib.parse.urlparse(url).path).name or "linked.pdf",
+                                                "content_type": "application/pdf",
+                                                "sha": sha256_bytes(data),
+                                                "data": data,
+                                            }
+                                        ]
+                                        break
+                                    if _looks_like_zip(data):
+                                        # Extract PDFs from ZIP
+                                        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                                            extracted = []
+                                            for info in zf.infolist():
+                                                if info.is_dir():
+                                                    continue
+                                                if info.filename.lower().endswith(".pdf"):
+                                                    b = zf.read(info)
+                                                    extracted.append(
+                                                        {
+                                                            "name": info.filename,
+                                                            "content_type": "application/pdf",
+                                                            "sha": sha256_bytes(b),
+                                                            "data": b,
+                                                        }
+                                                    )
+                                        if len(extracted) == 1:
+                                            pdfs = extracted
+                                            break
                             except Exception:
                                 pass
 
