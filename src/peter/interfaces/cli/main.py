@@ -49,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     ia.add_argument("--code", required=True)
     ia.add_argument("--report-code", required=True)
 
+    sub.add_parser("daemon", help="Run long-lived service loop")
+
     ep = sub.add_parser("email-poll", help="Run Microsoft Graph inbox poll loop (Phase 2)")
 
     q = sub.add_parser("query", help="Query site history")
@@ -121,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
             out = report_svc.image_audit(site_code=args.code, report_code=args.report_code)
             print(out)
             return 0
+
+        if args.cmd == "daemon":
+            from peter.daemon import run as daemon_run
+
+            return int(daemon_run())
 
         if args.cmd == "email-poll":
             from peter.interfaces.email.watcher import main as email_main
