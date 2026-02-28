@@ -69,7 +69,8 @@ def build_flags(clean_text: str) -> list[Flag]:
         ("MOISTURE_HIGH", "High moisture mentioned", re.compile(r"\bHIGH\s+moisture\b|\bmoisture\s+content\b", re.I)),
         # Avoid matching generic PASS/FAIL tables; prefer narrative phrases.
         ("MOISTURE_FAIL", "Moisture FAIL / not acceptable indicated", re.compile(r"\bmoisture\b.{0,40}\bfail\b|\bfail\b.{0,40}\bmoisture\b|\bnot\s+acceptable\b", re.I)),
-        ("DFT_LOW", "Low DFT mentioned", re.compile(r"\bDFT\b.{0,40}\blow\b|\blow\b.{0,40}\bDFT\b|\bdry\s+film\s+thickness\b.{0,40}\blow\b", re.I)),
+        # DFT often appears as: "DFT tests ... was noted to be low" (gap can be long)
+        ("DFT_LOW", "Low DFT mentioned", re.compile(r"\bDFT\b.{0,160}\blow\b|\blow\b.{0,80}\bDFT\b|\bdry\s+film\s+thickness\b.{0,160}\blow\b", re.I)),
         ("BLISTERING", "Blistering/bubbling mentioned", re.compile(r"\bblister(?:ing)?\b|\bbubbl(?:e|ing)\b", re.I)),
         ("PEELING_FLAKING", "Peeling/flaking mentioned", re.compile(r"\bpeel(?:ing)?\b|\bflak(?:ing|es)?\b", re.I)),
     ]
