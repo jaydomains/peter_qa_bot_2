@@ -53,6 +53,12 @@ def _evidence_lines(text: str, pattern: re.Pattern[str], *, max_lines: int = 3) 
 
 
 def build_flags(clean_text: str) -> list[Flag]:
+    """Build deterministic flags from extracted text.
+
+    Intended for narrative sections (e.g. Executive Summary). If you pass the
+    entire PDF-extracted text (including tables), you may get noisy matches.
+    """
+
     t = clean_text or ""
 
     flags: list[Flag] = []
@@ -61,7 +67,8 @@ def build_flags(clean_text: str) -> list[Flag]:
         ("CRACKING", "Cracking mentioned", re.compile(r"\bcrack(?:ing|s)?\b", re.I)),
         ("DELAMINATION", "Delamination mentioned", re.compile(r"\bdelaminat(?:ion|ing)\b", re.I)),
         ("MOISTURE_HIGH", "High moisture mentioned", re.compile(r"\bHIGH\s+moisture\b|\bmoisture\s+content\b", re.I)),
-        ("MOISTURE_FAIL", "Moisture FAIL / not acceptable indicated", re.compile(r"\bFAIL\b", re.I)),
+        # Avoid matching generic PASS/FAIL tables; prefer narrative phrases.
+        ("MOISTURE_FAIL", "Moisture FAIL / not acceptable indicated", re.compile(r"\bmoisture\b.{0,40}\bfail\b|\bfail\b.{0,40}\bmoisture\b|\bnot\s+acceptable\b", re.I)),
         ("BLISTERING", "Blistering/bubbling mentioned", re.compile(r"\bblister(?:ing)?\b|\bbubbl(?:e|ing)\b", re.I)),
         ("PEELING_FLAKING", "Peeling/flaking mentioned", re.compile(r"\bpeel(?:ing)?\b|\bflak(?:ing|es)?\b", re.I)),
     ]

@@ -237,7 +237,15 @@ class ReportService:
         from peter.analysis.summary_flags import build_flags, extract_section_excerpt
 
         clean = clean_extracted_text(raw_text)
-        flags = build_flags(clean)
+
+        # Prefer narrative sections for evidence (reduce table noise).
+        evidence_text = (
+            extract_section_excerpt(clean, "Executive Summary", window=2500)
+            or extract_section_excerpt(clean, "Concerns", window=1500)
+            or clean
+        )
+
+        flags = build_flags(evidence_text)
 
         parts: list[str] = []
         parts.append(f"REPORT SUMMARY (text-only)\nsite={site.site_code} report={rc} sha={sha}")
@@ -301,7 +309,14 @@ class ReportService:
 
         raw_text = self._load_report_text(site=site, rc=rc, sha=sha)
         clean = clean_extracted_text(raw_text)
-        flags = build_flags(clean)
+
+        evidence_text = (
+            extract_section_excerpt(clean, "Executive Summary", window=2500)
+            or extract_section_excerpt(clean, "Concerns", window=1500)
+            or clean
+        )
+
+        flags = build_flags(evidence_text)
 
         # Map deterministic flags to issue severity/blocking.
         # Keep it conservative; tune later.
