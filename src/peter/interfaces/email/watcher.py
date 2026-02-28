@@ -269,11 +269,101 @@ class EmailWatcher:
 
                         # Ingest as QA_REPORT
                         out = report_svc.ingest_report(site_code=site, report_code=rep, file_path=item.file_path)
+
+                        # Always triage + vision after confirm so a reply can be sent.
                         try:
                             report_svc.triage_report_text(site_code=site, report_code=rep, reset=True)
                         except Exception:
                             pass
-                        update_status(item=item, status="CONFIRMED", extra={"confirmed_by": from_addr_cmd, "site": site, "report": rep, "ingest": out})
+
+                        vision_note = ""
+                        if os.getenv("PETER_VISION_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+                            try:
+                                out_v = report_svc.analyze_report_visuals(site_code=site, report_code=rep, reset=True)
+                                n = len(out_v.get("omission_issues_created") or [])
+                                vision_json = out_v.get("vision_json")
+                                vision_note = (
+                                    "\n\nVISION CHECK (auto)\n"
+                                    f"- visual omissions flagged: {n}\n"
+                                    f"- artifact: {vision_json}\n"
+                                )
+                            except Exception as e:
+                                vision_note = f"\n\nVISION CHECK (auto)\n- ERROR: {str(e)[:200]}\n"
+
+                        # Draft and send a confirmation reply (internal-only)
+                        reply_text = ""
+                        try:
+                            use_llm = os.getenv("PETER_EMAIL_DRAFT_USE_OPENAI", "").strip().lower() in ("1", "true", "yes")
+                            if use_llm and self.settings.OPENAI_API_KEY:
+                                from peter.interfaces.email.llm_reply import draft_email_reply_llm
+
+                                reply_text = draft_email_reply_llm(
+                                    conn=conn,
+                                    settings=self.settings,
+                                    site_code=site,
+                                    report_code=rep,
+                                    vision_text=vision_note,
+                                )
+                            else:
+                                from peter.interfaces.qa.ask import answer_report_question
+
+                                reply_text = (
+                                    answer_report_question(
+                                        conn=conn,
+                                        settings=self.settings,
+                                        site_code=site,
+                                        report_code=rep,
+                                        question=(
+                                            "Summarize the QA status for this report and list required next actions to address blocking issues. "
+                                            "Be concise and use bullets where helpful."
+                                        ),
+                                        mode="recommend",
+                                    ).rstrip()
+                                    + vision_note
+                                    + "\n"
+                                )
+                        except Exception:
+                            reply_text = f"CONFIRM OK {item.qid}: site={site} report={rep} status={out.get('status')} report_id={out.get('report_id')}" + vision_note
+
+                        update_status(
+                            item=item,
+                            status="CONFIRMED",
+                            extra={
+                                "confirmed_by": from_addr_cmd,
+                                "site": site,
+                                "report": rep,
+                                "ingest": out,
+                            },
+                        )
+
+                        # Send a new internal-only message (not in-thread) to the confirmer.
+                        try:
+                            draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                            draft_id = draft["id"]
+
+                            # Subject tag
+                            subj = f"CONFIRM OK {item.qid}"
+                            graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload={"subject": subj})
+
+                            to_list, cc_list = build_sanitized_reply_recipients(
+                                internal_domain=self.settings.INTERNAL_DOMAIN,
+                                original_from=from_addr_cmd,
+                                original_to=[],
+                                original_cc=[],
+                                bot_mailbox=self.settings.BOT_MAILBOX,
+                                forced_cc=list(self.settings.REVIEW_DLIST),
+                            )
+                            assert_internal_only(to_list, cc_list, internal_domain=self.settings.INTERNAL_DOMAIN)
+
+                            payload = {
+                                "toRecipients": [{"emailAddress": {"address": a}} for a in to_list],
+                                "ccRecipients": [{"emailAddress": {"address": a}} for a in cc_list],
+                                "body": {"contentType": "Text", "content": reply_text},
+                            }
+                            graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload=payload)
+                            graph.send_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id)
+                        except Exception:
+                            pass
 
                         graph.mark_read(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
                         continue
