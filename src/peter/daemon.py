@@ -14,6 +14,12 @@ from peter.services.report_service import ReportService
 from peter.services.site_service import SiteService
 from peter.services.spec_service import SpecService
 
+# Optional Phase 2: Microsoft Graph email polling
+try:
+    from peter.interfaces.email.watcher import EmailWatcher
+except Exception:  # pragma: no cover
+    EmailWatcher = None  # type: ignore
+
 log = logging.getLogger("peter.daemon")
 
 
@@ -172,6 +178,16 @@ def run(*, cfg: DaemonConfig | None = None) -> int:
 
     while not _Stop.requested:
         try:
+            # Phase 2: poll email (optional). This is safe to enable alongside
+            # filesystem inbox drops; both feed the same ingestion services.
+            email_enabled = os.getenv("PETER_EMAIL_ENABLED", "").strip().lower() in ("1", "true", "yes")
+            if email_enabled and EmailWatcher is not None:
+                try:
+                    EmailWatcher(settings).run_once()
+                except Exception:
+                    # Policy: email failures must not stop the daemon.
+                    log.exception("EMAIL poll failed (continuing daemon loop)")
+
             process_inbox_once(settings=settings)
             time.sleep(cfg.tick_seconds)
         except Exception:
