@@ -457,7 +457,26 @@ class ReportService:
         pdf_path = pdf_path.resolve()
 
         pages_dir = sandbox.ensure_dir("03_reviews", f"{site.site_code}__{rc}__{sha[:12]}__pages")
-        rendered = render_pdf_pages(pdf_path, out_dir=pages_dir, prefix=f"{site.site_code}__{rc}__{sha[:12]}", dpi=300)
+        max_pages_raw = os.getenv("PETER_VISION_MAX_PAGES", "").strip().lower()
+        max_pages = None
+        if max_pages_raw and max_pages_raw not in ("all", "0", "none"):
+            try:
+                max_pages = max(1, int(max_pages_raw))
+            except Exception:
+                max_pages = None
+
+        last_page = None
+        if max_pages is not None:
+            last_page = max_pages
+
+        rendered = render_pdf_pages(
+            pdf_path,
+            out_dir=pages_dir,
+            prefix=f"{site.site_code}__{rc}__{sha[:12]}",
+            dpi=300,
+            first_page=1,
+            last_page=last_page,
+        )
 
         api_key = self.settings.OPENAI_API_KEY
         model = os.getenv("PETER_VISION_MODEL", "gpt-4.1")
