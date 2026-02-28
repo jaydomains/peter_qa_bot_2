@@ -59,10 +59,20 @@ class ReportService:
         """
 
         rc = (report_code or "").strip().upper().replace(" ", "")
+
+        # Accept traditional codes like R01 / R12
         if re.fullmatch(r"R\d{2,3}", rc):
             return rc
+
+        # Accept numeric inspection refs like 002 / 12
         if re.fullmatch(r"\d{2,3}", rc):
-            return rc
+            return rc.zfill(3)
+
+        # Accept combined refs like PRSVNQA-002 and normalize to 002.
+        m = re.fullmatch(r"[A-Z0-9_-]{3,20}[-_]?((?:\d){2,3})", rc)
+        if m:
+            return m.group(1).zfill(3)
+
         raise ValidationError("report_code must look like R01 / R12 / 002")
 
     def _template_extract_site_and_ref(self, text: str) -> tuple[str | None, str | None]:

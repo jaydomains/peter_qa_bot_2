@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import time
 from dataclasses import dataclass
@@ -61,8 +62,27 @@ def process_inbox_once(*, settings: Settings) -> None:
     spec_files = sorted(spec_root.glob("*/*.pdf"))
     report_files = sorted(report_root.glob("*/*.pdf"))
 
+    max_files = int(os.getenv("PETER_INBOX_MAX_FILES_PER_TICK", "20"))
+    if max_files < 1:
+        max_files = 1
+
     if not spec_files and not report_files:
         return
+
+    total_found = len(spec_files) + len(report_files)
+    if total_found > max_files:
+        log.warning(
+            "INBOX: found %d files (spec=%d report=%d) > max=%d; processing first max files only",
+            total_found,
+            len(spec_files),
+            len(report_files),
+            max_files,
+        )
+        # Fair-ish: interleave by mtime would be ideal; simplest: process specs then reports.
+        # Keep ordering deterministic.
+        spec_files = spec_files[: max_files]
+        remaining = max_files - len(spec_files)
+        report_files = report_files[: max(0, remaining)]
 
     with get_connection(settings.DB_PATH) as conn:
         init_db(conn)
@@ -75,6 +95,7 @@ def process_inbox_once(*, settings: Settings) -> None:
             version = path.stem.strip()
 
             try:
+                t0 = time.monotonic()
                 log.info("INBOX spec: site=%s version=%s file=%s", site_code, version, str(path))
                 # Ensure site exists (idempotent if already created).
                 site_svc.get_site_or_raise(site_code)
@@ -82,6 +103,10 @@ def process_inbox_once(*, settings: Settings) -> None:
 
                 dest = inbox / "processed" / "spec" / site_code / path.name
                 _safe_move(path, dest)
+                dt = time.monotonic() - t0
+                warn_s = float(os.getenv("PETER_INBOX_FILE_WARN_SECONDS", "20"))
+                if dt > warn_s:
+                    log.warning("INBOX spec slow: %.2fs file=%s", dt, str(dest))
                 log.info("INBOX spec OK -> %s", str(dest))
             except Exception:
                 log.exception("INBOX spec FAILED: %s", str(path))
@@ -97,6 +122,7 @@ def process_inbox_once(*, settings: Settings) -> None:
             inspection_ref = path.stem.strip()
 
             try:
+                t0 = time.monotonic()
                 log.info("INBOX report: site=%s ref=%s file=%s", site_code, inspection_ref, str(path))
                 site_svc.get_site_or_raise(site_code)
 
@@ -105,6 +131,10 @@ def process_inbox_once(*, settings: Settings) -> None:
                 # Move to processed as soon as ingest succeeds (source-of-truth is now stored in sandbox).
                 dest = inbox / "processed" / "report" / site_code / path.name
                 _safe_move(path, dest)
+                dt = time.monotonic() - t0
+                warn_s = float(os.getenv("PETER_INBOX_FILE_WARN_SECONDS", "20"))
+                if dt > warn_s:
+                    log.warning("INBOX report slow: %.2fs file=%s", dt, str(dest))
                 log.info("INBOX report OK -> %s", str(dest))
 
                 # Policy B: triage failure must not quarantine or undo ingest.

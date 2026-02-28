@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--question", required=True)
     ask.add_argument("--mode", choices=["grounded", "recommend"], default="grounded")
 
+    lr = sub.add_parser("list-reports", help="List reports for a site")
+    lr.add_argument("--code", required=True)
+    lr.add_argument("--limit", type=int, default=20)
+
     ia = sub.add_parser("image-audit", help="Audit report pages for photo/table/labels (no defect inference)")
     ia.add_argument("--code", required=True)
     ia.add_argument("--report-code", required=True)
@@ -189,6 +193,28 @@ def main(argv: list[str] | None = None) -> int:
                     mode=args.mode,
                 )
             )
+            return 0
+
+        if args.cmd == "list-reports":
+            site_code = (args.code or "").strip().upper()
+            limit = max(1, int(args.limit))
+            rows = conn.execute(
+                """
+                SELECT r.report_code, r.received_at, r.result, r.sha256
+                FROM reports r
+                JOIN sites s ON s.id = r.site_id
+                WHERE s.site_code = ?
+                ORDER BY r.received_at DESC
+                LIMIT ?
+                """,
+                (site_code, limit),
+            ).fetchall()
+            if not rows:
+                print("No reports for this site.")
+                return 0
+            print(f"REPORTS site={site_code} (latest {len(rows)})")
+            for r in rows:
+                print(f"- {r['report_code']} received_at={r['received_at']} result={r['result']} sha={str(r['sha256'])[:12]}")
             return 0
 
         if args.cmd == "image-audit":
