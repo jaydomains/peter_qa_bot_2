@@ -86,6 +86,33 @@ class SpecService:
             checklist_path = sandbox.build_path("00_admin", checklist_name)
             checklist_path.write_text(json.dumps(checklist, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             checklist_rel = str(checklist_path.relative_to(self.settings.QA_ROOT))
+
+            # Build a paint product allowlist (strict, no substitutions by default)
+            try:
+                from peter.knowledge.spec_products import extract_allowed_products
+
+                use_openai = os.getenv("PETER_SPEC_PRODUCTS_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
+                model = os.getenv("PETER_SPEC_PRODUCTS_MODEL", "gpt-4.1")
+                products = extract_allowed_products(spec_text=spec_text, use_openai=use_openai, model=model)
+                products_name = f"{site.site_code}__PRODUCTS__{vlabel}__{sha[:12]}.json"
+                products_path = sandbox.build_path("00_admin", products_name)
+                products_path.write_text(
+                    json.dumps(
+                        {
+                            "site_code": site.site_code,
+                            "version": vlabel,
+                            "sha256": sha,
+                            "paint_products": [p.__dict__ for p in products if p.kind == "PAINT"],
+                            "notes": "Generated from spec text; strict allowlist (paint only).",
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
         except PdfTextExtractionError:
             # Spec still ingested, but without extracted text/checklist.
             pass
