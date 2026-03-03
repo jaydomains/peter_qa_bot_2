@@ -46,45 +46,44 @@ def _build_evidence_pack(
         except Exception:
             rc = rc_in
 
-    # Try exact match first; then fall back between R### and ### forms.
-    row = conn.execute(
-        """
-        SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result
-        FROM reports r
-        JOIN sites s ON s.id = r.site_id
-        WHERE s.site_code = ? AND r.report_code = ?
-        ORDER BY r.received_at DESC
-        LIMIT 1
-        """,
-        (sc, rc),
-    ).fetchone()
+    def _fetch(code: str):
+        return conn.execute(
+            """
+            SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result, r.report_code
+            FROM reports r
+            JOIN sites s ON s.id = r.site_id
+            WHERE s.site_code = ? AND r.report_code = ?
+            ORDER BY r.received_at DESC
+            LIMIT 1
+            """,
+            (sc, code),
+        ).fetchone()
 
+    row = _fetch(rc)
+    # If not found, try alternate prefixes (R### vs ###) and vice versa.
     if not row:
-        alt = None
+        fallbacks: list[str] = []
         if re.fullmatch(r"R\d{2,3}", rc):
-            alt = rc[1:].zfill(3)
+            fallbacks.append(rc[1:].zfill(3))
         elif re.fullmatch(r"\d{2,3}", rc):
-            alt = "R" + rc.zfill(3)
-        if alt:
-            row = conn.execute(
-                """
-                SELECT r.id, r.sha256, r.stored_path, r.received_at, r.result
-                FROM reports r
-                JOIN sites s ON s.id = r.site_id
-                WHERE s.site_code = ? AND r.report_code = ?
-                ORDER BY r.received_at DESC
-                LIMIT 1
-                """,
-                (sc, alt),
-            ).fetchone()
+            fallbacks.append("R" + rc.zfill(3))
+        # include original input if distinct (covers legacy strings)
+        if rc_in not in (rc, *fallbacks):
+            fallbacks.append(rc_in)
+        for alt in fallbacks:
+            row = _fetch(alt)
+            if row:
+                rc = alt
+                break
     if not row:
-        raise ValidationError(f"Report not found for site={sc} report_code={rc}")
+        raise ValidationError(f"Report not found for site={sc} report_code={rc_in}")
 
     report_id = int(row["id"])
+    report_code_db = (row["report_code"] or rc).strip()
 
     meta = (
         f"site={sc}\n"
-        f"report_code={rc}\n"
+        f"report_code={report_code_db}\n"
         f"received_at={row['received_at']}\n"
         f"result={row['result']}\n"
         f"sha256={row['sha256']}\n"
@@ -97,7 +96,7 @@ def _build_evidence_pack(
         from peter.services.report_service import ReportService
 
         svc = ReportService(conn, settings)
-        summary = svc.summarize_report_text(site_code=sc, report_code=rc)
+        summary = svc.summarize_report_text(site_code=sc, report_code=report_code_db)
         marker = "EXECUTIVE SUMMARY (excerpt)"
         if marker in summary:
             exec_excerpt = summary.split(marker, 1)[1].strip()
@@ -122,7 +121,7 @@ def _build_evidence_pack(
     blocking_lines: list[str] = []
     other_lines: list[str] = []
     for r in issues_rows[:40]:
-        block = bool(int(r["is_blocking"] or 0))
+        block = bool(int(r["is_blocking" or 0]))
         desc = str(r["description"] or "")
         desc = desc.replace("\r", " ").strip()
         line = f"- [{r['severity']}] [{'blocking' if block else 'non-blocking'}] {r['category']} ({r['issue_type']}): {desc[:380]}"
