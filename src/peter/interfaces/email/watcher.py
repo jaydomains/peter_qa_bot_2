@@ -22,7 +22,7 @@ from peter.db.schema import init_db
 from peter.db.repositories.email_repo import EmailEventRepository
 from peter.db.repositories.site_repo import SiteRepository
 from peter.interfaces.email.classifier import parse_subject
-from peter.interfaces.email.confirm_commands import parse_confirm_subject, parse_confirm_freeform
+from peter.interfaces.email.confirm_commands import parse_confirm_subject, parse_confirm_freeform, coerce_project_type
 from peter.interfaces.qa.openai_ask import ask_openai_responses
 from peter.interfaces.email.quarantine_queue import load_quarantine_item, save_quarantine_item, update_status, list_items
 from peter.interfaces.email.report_identity import infer_from_pdf_bytes
@@ -291,6 +291,109 @@ def _friendly_error_via_llm(*, settings: Settings, subject: str, body: str, erro
         return None
 
 
+def _draft_confirmation_via_llm(*, settings: Settings, subject: str, situation: str, hints: dict[str, str | None], confirm_lines: list[str]) -> str | None:
+    """Draft a clearer technician-facing confirmation request.
+
+    We keep parsing deterministic by appending the exact CONFIRM/REJECT lines ourselves.
+    """
+
+    enabled = os.getenv("PETER_EMAIL_CONFIRM_DRAFT_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return None
+    api_key = (settings.OPENAI_API_KEY or "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("PETER_EMAIL_CONFIRM_MODEL", "gpt-4.1")
+
+    # Keep it short and practical.
+    system = (
+        "You are PETER, an internal QA inbox assistant for field technicians. "
+        "Write a short, plain-English message asking for confirmation so the system can file the report correctly. "
+        "Do NOT include any filesystem paths, internal IDs besides the Quarantine ID, or code. "
+        "Use numbered steps. "
+        "Do not include the literal CONFIRM/REJECT commands; those will be appended separately."
+    )
+
+    hint_lines = []
+    for k, v in (hints or {}).items():
+        if v:
+            hint_lines.append(f"- {k}: {v}")
+    hints_text = "\n".join(hint_lines) if hint_lines else "(none)"
+
+    user = (
+        f"EMAIL SUBJECT: {subject}\n\n"
+        f"SITUATION: {situation}\n\n"
+        f"HINTS:\n{hints_text}\n\n"
+        "Write the technician-facing message." 
+    )
+
+    try:
+        body = ask_openai_responses(api_key=api_key, model=model, system=system, user=user, timeout=60).strip()
+        if not body:
+            return None
+        # Append exact commands (machine-parseable)
+        cmds = "\n".join(confirm_lines)
+        return (
+            body
+            + "\n\nReply with ONE of these lines (copy/paste):\n"
+            + cmds
+            + "\n"
+        )
+    except Exception:
+        return None
+
+
+def _parse_confirmation_reply_via_llm(*, settings: Settings, qid: str, subject: str, body: str) -> dict | None:
+    """Parse a technician confirmation reply using OpenAI.
+
+    Goal: allow replies like "Yes confirmed redec" (no strict command syntax).
+    Returns dict keys: kind(CONFIRM|REJECT|NONE), site(str|None), report(str|None), project_type(NEW_WORK|REDEC|None)
+    """
+
+    enabled = os.getenv("PETER_EMAIL_CONFIRM_PARSE_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return None
+    api_key = (settings.OPENAI_API_KEY or "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("PETER_EMAIL_CONFIRM_PARSE_MODEL", "gpt-4.1")
+
+    system = (
+        "You are a strict parser for technician email replies. "
+        "Extract confirmation intent and any provided fields. "
+        "Return ONLY valid JSON. No markdown.\n"
+        "Schema:\n"
+        "{\"kind\":\"CONFIRM|REJECT|NONE\",\"site\":string|null,\"report\":string|null,\"project_type\":\"NEW_WORK|REDEC\"|null}\n"
+        "Rules:\n"
+        "- If the reply indicates confirmation/approval/yes => kind=CONFIRM.\n"
+        "- If it indicates rejection/incorrect/no => kind=REJECT.\n"
+        "- If unclear => kind=NONE.\n"
+        "- Site codes look like 3-20 chars A-Z0-9 (e.g. PLA22HHACQA).\n"
+        "- Report refs may appear as R009, 009, Report 9; normalize to R### (e.g. R009) when possible.\n"
+        "- Project type: NEW_WORK for new build/new work; REDEC for redecoration/repaint.\n"
+        "- Ignore quoted option lists; focus on what the sender is choosing." 
+    )
+
+    user = (
+        f"QID: {qid}\n"
+        f"SUBJECT: {subject}\n\n"
+        f"BODY:\n{(body or '')[:3000]}\n"
+    )
+
+    try:
+        raw = ask_openai_responses(api_key=api_key, model=model, system=system, user=user, timeout=45).strip()
+        import json as _json
+
+        data = _json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def _has_external(addrs: list[str], *, internal_domain: str) -> bool:
     dom = internal_domain.lower()
     for a in addrs or []:
@@ -453,9 +556,28 @@ class EmailWatcher:
                         body0 = str(((full0.get("body") or {}).get("content") or "")).strip()
                     except Exception:
                         body0 = ""
+
                     conf2 = parse_confirm_freeform(subject, body0)
                     if conf2.kind in ("CONFIRM", "REJECT") and conf2.qid:
                         conf = conf2
+                    else:
+                        # LLM-assisted parse: allow "yes confirmed redec" without strict command syntax.
+                        # Requires QID to be present somewhere in subject/body.
+                        import re as _re
+
+                        m_q = _re.search(r"\b(Q-\d{8}-\d{6}-[0-9a-fA-F]{4})\b", (subject or "") + "\n" + (body0 or ""), flags=_re.I)
+                        qid = m_q.group(1) if m_q else None
+                        if qid:
+                            parsed = _parse_confirmation_reply_via_llm(settings=self.settings, qid=qid, subject=subject, body=body0)
+                            if isinstance(parsed, dict):
+                                kind = str(parsed.get("kind") or "NONE").strip().upper()
+                                if kind in ("CONFIRM", "REJECT"):
+                                    site2 = (parsed.get("site") or None)
+                                    rep2 = (parsed.get("report") or None)
+                                    ptype2 = coerce_project_type(parsed.get("project_type") or None)
+                                    from peter.interfaces.email.confirm_commands import ConfirmCommand
+
+                                    conf = ConfirmCommand(kind, qid, site2, rep2, ptype2, None)
 
                 if conf.kind in ("CONFIRM", "REJECT") and conf.qid:
                     from_addr_cmd = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
@@ -803,9 +925,12 @@ class EmailWatcher:
                         if len(pdf_candidates) == 1:
                             rid = infer_from_pdf_bytes(pdf_candidates[0])
                             if rid:
+                                # Option A (safer): do NOT auto-accept site codes inferred from PDFs.
+                                # We only use the detected report number as a hint; site_code must be
+                                # explicitly confirmed/provided.
                                 from peter.interfaces.email.classifier import ParsedCommand
 
-                                cmd = ParsedCommand("QA_REPORT", rid.site_code, rid.report_no)
+                                cmd = ParsedCommand("QA_REPORT", None, rid.report_no)
                     except Exception:
                         # Keep UNKNOWN if anything fails.
                         pass
@@ -874,17 +999,20 @@ class EmailWatcher:
                         reply_text = f"OK created site {cmd.site_code}"
 
                     elif cmd.kind in {"SPEC_UPDATE", "QA_REPORT"}:
-                        if not cmd.site_code:
-                            raise RuntimeError("Missing site_code")
+                        # IMPORTANT (Option A / safer): never guess site codes.
+                        # If site_code is missing or ambiguous, quarantine and request confirmation.
 
-                        # Resolve site sandbox for quarantine/archival.
-                        # Technician-friendly onboarding: for first-time sites, require confirmation
-                        # before committing a new site to memory.
-                        site = site_repo.get_by_code(cmd.site_code)
+                        # Initialize shared vars used later in the pipeline to avoid UnboundLocalError.
+                        rc = None
+                        out = None
+                        vision_note = ""
+
+                        # Resolve site sandbox for quarantine/archival (if known).
+                        site = site_repo.get_by_code(cmd.site_code) if cmd.site_code else None
                         require_first = os.getenv("PETER_EMAIL_REQUIRE_SITE_CONFIRM_FIRST_TIME", "1").strip().lower() in ("1", "true", "yes")
                         if not site and cmd.kind == "QA_REPORT" and require_first:
                             site = None
-                        elif not site:
+                        elif not site and cmd.site_code:
                             auto = os.getenv("PETER_AUTO_CREATE_SITES", "").strip().lower() in ("1", "true", "yes")
                             if auto:
                                 # Placeholder name; you can formalize later.
@@ -945,6 +1073,19 @@ class EmailWatcher:
                         zips = [d for d in downloaded if _is_zip(d)]
                         others = [d for d in downloaded if (d not in pdfs and d not in zips)]
 
+                        # Deduplicate PDFs by sha (Graph/Outlook can surface the same attachment twice).
+                        if pdfs:
+                            uniq = []
+                            seen_sha = set()
+                            for p in pdfs:
+                                sha = str(p.get("sha") or "")
+                                if sha and sha in seen_sha:
+                                    continue
+                                if sha:
+                                    seen_sha.add(sha)
+                                uniq.append(p)
+                            pdfs = uniq
+
                         # If no PDFs but a single ZIP is present, extract PDFs from ZIP.
                         if not pdfs and len(zips) == 1:
                             try:
@@ -955,21 +1096,113 @@ class EmailWatcher:
                                         if info.is_dir():
                                             continue
                                         if info.filename.lower().endswith(".pdf"):
+                                            b = zf.read(info)
                                             extracted.append(
                                                 {
                                                     "name": info.filename,
                                                     "content_type": "application/pdf",
-                                                    "sha": sha256_bytes(zf.read(info)),
-                                                    "data": zf.read(info),
+                                                    "sha": sha256_bytes(b),
+                                                    "data": b,
                                                 }
                                             )
-                                pdfs = extracted
+                                # Dedup extracted PDFs by sha as well.
+                                uniq = []
+                                seen_sha = set()
+                                for p in extracted:
+                                    sha = str(p.get("sha") or "")
+                                    if sha and sha in seen_sha:
+                                        continue
+                                    if sha:
+                                        seen_sha.add(sha)
+                                    uniq.append(p)
+                                pdfs = uniq
                             except Exception:
                                 pdfs = []
 
+                        # Option A: If site code was not explicitly provided, quarantine and request confirmation.
+                        if not cmd.site_code and cmd.kind == "QA_REPORT":
+                            if len(pdfs) != 1:
+                                reply_text = (
+                                    "QUARANTINED (missing site code)\n"
+                                    "\n"
+                                    "I couldn't find a site code in the email subject.\n"
+                                    "Please resend with subject: QA REPORT | <SITE_CODE> | <RXX>\n"
+                                    f"PDFs detected: {len(pdfs)}\n"
+                                )
+                            else:
+                                p = pdfs[0]
+                                rid = None
+                                try:
+                                    rid = infer_from_pdf_bytes(p["data"])
+                                except Exception:
+                                    rid = None
+
+                                detected_site = (rid.site_code if rid else None)
+                                detected_rep = (rid.report_no if rid else None) or ((cmd.arg or "").strip().upper().replace(" ", "") or None)
+
+                                item = save_quarantine_item(
+                                    data_dir=Path(self.settings.DATA_DIR),
+                                    filename=p["name"],
+                                    content=p["data"],
+                                    meta={
+                                        "original_from": from_addr,
+                                        "graph_message_id": mid,
+                                        "subject": subject,
+                                        "claimed_site": None,
+                                        "claimed_report": cmd.arg,
+                                        "detected_site": detected_site,
+                                        "detected_report": detected_rep,
+                                        "note": "Missing site code in subject; confirmation required",
+                                    },
+                                )
+
+                                # Audit attachment record
+                                try:
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=p["name"],
+                                        content_type=p["content_type"],
+                                        sha256=p["sha"],
+                                        stored_path=str(item.file_path),
+                                        quarantined=True,
+                                    )
+                                except Exception:
+                                    pass
+
+                                hint = ""
+                                if detected_site or detected_rep:
+                                    hint = f"Detected from PDF (unconfirmed): site={detected_site or '?'} report={detected_rep or '?'}"
+
+                                confirm_lines = [
+                                    f"CONFIRM {item.qid} | SITE=<SITE_CODE> | REPORT=<NNN>",
+                                    f"REJECT {item.qid}",
+                                ]
+                                drafted = _draft_confirmation_via_llm(
+                                    settings=self.settings,
+                                    subject=subject,
+                                    situation="I received a QA report PDF, but the email subject did not include a site code. I need you to confirm the site code and report number so I can file it.",
+                                    hints={
+                                        "Quarantine ID": item.qid,
+                                        "Detected from PDF (unconfirmed)": hint or None,
+                                        "How to format next time": "QA REPORT | <SITE_CODE> | <RXX>",
+                                    },
+                                    confirm_lines=confirm_lines,
+                                )
+
+                                reply_text = drafted or (
+                                    "QUARANTINED (missing site code)\n"
+                                    f"Quarantine ID: {item.qid}\n\n"
+                                    + (f"{hint}\n\n" if hint else "")
+                                    + "Reply with ONE of these lines (copy/paste):\n"
+                                    + "\n".join(confirm_lines)
+                                    + "\n"
+                                )
+
+                            # Skip further processing for this message.
+                            
                         # If this is the first time we've seen the site, require confirmation
                         # before committing the site + ingesting.
-                        if site is None and cmd.kind == "QA_REPORT" and require_first:
+                        if site is None and cmd.kind == "QA_REPORT" and require_first and not reply_text.startswith("QUARANTINED"):
                             if len(pdfs) != 1:
                                 reply_text = (
                                     f"NEW SITE (confirmation required)\n\n"
@@ -993,7 +1226,11 @@ class EmailWatcher:
                                 if claimed_rep.isdigit():
                                     claimed_rep = claimed_rep.zfill(3)
 
-                                detected_site = (rid.site_code if rid else claimed_site)
+                                # For first-time sites, do NOT blindly trust PDF-derived site codes.
+                                # Use the subject-provided site code as the proposed code, and only treat
+                                # PDF-derived identity as a hint (some PDFs are not in our template and can
+                                # contain misleading tokens like "PLASTERBOARD").
+                                detected_site = claimed_site
                                 detected_rep = (rid.report_no if rid else claimed_rep)
 
                                 item = save_quarantine_item(
@@ -1031,38 +1268,41 @@ class EmailWatcher:
                                 except Exception:
                                     pass
 
-                                # Compose confirmation request
-                                lines = [
-                                    "NEW SITE (confirmation required)",
-                                    f"Quarantine ID: {item.qid}",
-                                    "",
-                                    f"Proposed site reference: {detected_site}",
+                                confirm_lines = [
+                                    f"CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=NEW_WORK",
+                                    f"CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=REDEC",
+                                    f"REJECT {item.qid}",
                                 ]
-                                if rid and rid.site_name_display:
-                                    lines.append(f"Site name: {rid.site_name_display}")
-                                if rid and rid.address:
-                                    lines.append(f"Address: {rid.address}")
-                                if rid and rid.supplier_client:
-                                    lines.append(f"Supplier / Client: {rid.supplier_client}")
-                                if rid and rid.contractor_on_site:
-                                    lines.append(f"Contractor on site: {rid.contractor_on_site}")
-                                if detected_rep:
-                                    lines.append(f"Report number: {detected_rep}")
 
-                                lines += [
-                                    "",
-                                    "Project type (required):",
-                                    "- NEW_WORK  (new build / new work)",
-                                    "- REDEC     (redecoration / repaint)",
-                                    "",
-                                    "Reply with:",
-                                    f"- CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=NEW_WORK",
-                                    f"- CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=REDEC",
-                                    f"- REJECT {item.qid}",
-                                    "",
-                                    "(You can also reply in plain text like: 'Confirm Q-... redecorations')",
-                                ]
-                                reply_text = "\n".join(lines) + "\n"
+                                drafted = _draft_confirmation_via_llm(
+                                    settings=self.settings,
+                                    subject=subject,
+                                    situation="This site code is not in my database yet. Before I create the project and file this report, please confirm the site code and whether this is new work or a redecoration.",
+                                    hints={
+                                        "Quarantine ID": item.qid,
+                                        "Proposed site code": detected_site,
+                                        "Report number": detected_rep,
+                                        "Site name (from PDF)": (rid.site_name_display if rid else None),
+                                        "Site name (raw)": (rid.site_name_raw if rid else None),
+                                        "Address (from PDF)": (rid.address if rid else None),
+                                        "Supplier / Client": (rid.supplier_client if rid else None),
+                                        "Contractor on site": (rid.contractor_on_site if rid else None),
+                                        "Project type options": "NEW_WORK (new build) or REDEC (redecoration)",
+                                    },
+                                    confirm_lines=confirm_lines,
+                                )
+
+                                reply_text = drafted or (
+                                    "NEW SITE (confirmation required)\n"
+                                    f"Quarantine ID: {item.qid}\n\n"
+                                    f"Proposed site reference: {detected_site}\n"
+                                    + (f"Site name: {rid.site_name_display}\n" if rid and rid.site_name_display else "")
+                                    + (f"Address: {rid.address}\n" if rid and rid.address else "")
+                                    + (f"Report number: {detected_rep}\n" if detected_rep else "")
+                                    + "\nReply with ONE of these lines (copy/paste):\n"
+                                    + "\n".join(confirm_lines)
+                                    + "\n"
+                                )
 
                         else:
                             # Quarantine non-PDF attachments always
@@ -1200,15 +1440,30 @@ class EmailWatcher:
                                         "note": "Site code normalized from subject",
                                     },
                                 )
-                                reply_text = (
+                                confirm_lines = [
+                                    f"CONFIRM {item.qid} | SITE={norm_site} | REPORT={claimed_rep}",
+                                    f"REJECT {item.qid}",
+                                ]
+                                drafted = _draft_confirmation_via_llm(
+                                    settings=self.settings,
+                                    subject=subject,
+                                    situation="I received a report/spec email, but the site code in the subject needed to be normalized (spaces/punctuation removed). Please confirm the correct site code so I can file it.",
+                                    hints={
+                                        "Quarantine ID": item.qid,
+                                        "Provided site code": claimed_site_raw,
+                                        "Normalized site code": norm_site,
+                                        "Report reference": claimed_rep,
+                                    },
+                                    confirm_lines=confirm_lines,
+                                )
+                                reply_text = drafted or (
                                     f"QUARANTINED (site code needs confirmation)\n"
                                     f"Quarantine ID: {item.qid}\n\n"
                                     f"Provided site code: {claimed_site_raw}\n"
                                     f"Normalized site code: {norm_site}\n\n"
-                                    f"Reply with one of:\n"
-                                    f"- CONFIRM {item.qid} | SITE={norm_site} | REPORT={claimed_rep}\n"
-                                    f"- REJECT {item.qid}\n\n"
-                                    f"File saved: {str(item.file_path)}\n"
+                                    "Reply with ONE of these lines (copy/paste):\n"
+                                    + "\n".join(confirm_lines)
+                                    + "\n"
                                 )
                                 # Skip further processing for this message; reply will be sent below.
                                 # Mark as quarantined attachment for audit
@@ -1238,16 +1493,30 @@ class EmailWatcher:
                                         "detected_report": detected.report_no,
                                     },
                                 )
-                                reply_text = (
+                                confirm_lines = [
+                                    f"CONFIRM {item.qid}",
+                                    f"CONFIRM {item.qid} | SITE={detected.site_code} | REPORT={detected.report_no}",
+                                    f"REJECT {item.qid}",
+                                ]
+                                drafted = _draft_confirmation_via_llm(
+                                    settings=self.settings,
+                                    subject=subject,
+                                    situation="The site code and/or report number in your email subject does not match what I can read from the PDF. I need you to confirm which one is correct before I file it.",
+                                    hints={
+                                        "Quarantine ID": item.qid,
+                                        "Claimed (subject)": f"site={claimed_site} report={claimed_rep}",
+                                        "Detected from PDF": f"site={detected.site_code} report={detected.report_no}",
+                                    },
+                                    confirm_lines=confirm_lines,
+                                )
+                                reply_text = drafted or (
                                     f"QUARANTINED (needs confirmation)\n"
                                     f"Quarantine ID: {item.qid}\n\n"
                                     f"Claimed: site={claimed_site} report={claimed_rep}\n"
                                     f"Detected from PDF: site={detected.site_code} report={detected.report_no}\n\n"
-                                    f"Reply with one of:\n"
-                                    f"- CONFIRM {item.qid}\n"
-                                    f"- CONFIRM {item.qid} | SITE={detected.site_code} | REPORT={detected.report_no}\n"
-                                    f"- REJECT {item.qid}\n\n"
-                                    f"File saved: {str(item.file_path)}\n"
+                                    "Reply with ONE of these lines (copy/paste):\n"
+                                    + "\n".join(confirm_lines)
+                                    + "\n"
                                 )
                             elif detected is None:
                                 # If we cannot confidently detect identity, quarantine and ask for confirmation
@@ -1265,14 +1534,27 @@ class EmailWatcher:
                                         "detected_report": None,
                                     },
                                 )
-                                reply_text = (
+                                confirm_lines = [
+                                    f"CONFIRM {item.qid} | SITE=<SITE_CODE> | REPORT=<NNN>",
+                                    f"REJECT {item.qid}",
+                                ]
+                                drafted = _draft_confirmation_via_llm(
+                                    settings=self.settings,
+                                    subject=subject,
+                                    situation="I received a PDF, but I cannot reliably determine the site code and report number from the document. I need you to confirm them so I can file the report correctly.",
+                                    hints={
+                                        "Quarantine ID": item.qid,
+                                        "Claimed (subject)": f"site={claimed_site} report={claimed_rep}",
+                                    },
+                                    confirm_lines=confirm_lines,
+                                )
+                                reply_text = drafted or (
                                     f"QUARANTINED (cannot determine site/report from PDF)\n"
                                     f"Quarantine ID: {item.qid}\n\n"
                                     f"Claimed: site={claimed_site} report={claimed_rep}\n\n"
-                                    f"Reply with:\n"
-                                    f"- CONFIRM {item.qid} | SITE=<SITE> | REPORT=<NNN>\n"
-                                    f"- REJECT {item.qid}\n\n"
-                                    f"File saved: {str(item.file_path)}\n"
+                                    "Reply with ONE of these lines (copy/paste):\n"
+                                    + "\n".join(confirm_lines)
+                                    + "\n"
                                 )
 
                             out_path: Path | None = None
@@ -1292,44 +1574,134 @@ class EmailWatcher:
                                 except Exception:
                                     pass
                             else:
-                                # Write to email_drop for ingestion (idempotent by sha)
-                                drop = Path(self.settings.DATA_DIR) / "email_drop"
-                                drop.mkdir(parents=True, exist_ok=True)
-                                safe_name = f"{cmd.site_code}__{cmd.kind}__{p['sha'][:12]}__{p['name']}".replace("/", "_")
-                                out_path = drop / safe_name
-                                if not out_path.exists():
-                                    out_path.write_bytes(p["data"])
-
-                                email_att_repo.insert(
-                                    email_event_id=event_id,
-                                    filename=p["name"],
-                                    content_type=p["content_type"],
-                                    sha256=p["sha"],
-                                    stored_path=str(out_path),
-                                    quarantined=False,
-                                )
-
-                                if cmd.kind == "SPEC_UPDATE":
-                                    spec = spec_svc.ingest_spec(
-                                        site_code=cmd.site_code,
-                                        version_label=cmd.arg or "REV01",
-                                        file_path=out_path,
+                                # Guard: if the site is unknown at this point, do NOT attempt ingest.
+                                # Instead, quarantine and request confirmation (we may be joining mid-project,
+                                # so the first email could be R009 etc.).
+                                if site is None and cmd.site_code:
+                                    item = save_quarantine_item(
+                                        data_dir=Path(self.settings.DATA_DIR),
+                                        filename=p["name"],
+                                        content=p["data"],
+                                        meta={
+                                            "original_from": from_addr,
+                                            "graph_message_id": mid,
+                                            "subject": subject,
+                                            "claimed_site": cmd.site_code,
+                                            "claimed_report": (cmd.arg if cmd.kind == "QA_REPORT" else None),
+                                            "claimed_rev": (cmd.arg if cmd.kind == "SPEC_UPDATE" else None),
+                                            "note": "Unknown site code: confirmation required before creating site and ingesting",
+                                            "require_project_type": True if cmd.kind == "QA_REPORT" else False,
+                                        },
                                     )
-                                    reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
-                                else:
-                                    rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
-                                    out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
+                                    try:
+                                        email_att_repo.insert(
+                                            email_event_id=event_id,
+                                            filename=p["name"],
+                                            content_type=p["content_type"],
+                                            sha256=p["sha"],
+                                            stored_path=str(item.file_path),
+                                            quarantined=True,
+                                        )
+                                    except Exception:
+                                        pass
 
-                                # Always (re)triage so the reply reflects the latest deterministic issues/result.
-                                try:
-                                    report_svc.triage_report_text(site_code=cmd.site_code, report_code=rc, reset=True)
-                                except Exception:
-                                    pass
+                                    # Build a clear confirmation request (LLM drafted) with strict commands appended.
+                                    if cmd.kind == "QA_REPORT":
+                                        rep = (cmd.arg or "R01").strip().upper().replace(" ", "")
+                                        confirm_lines = [
+                                            f"CONFIRM {item.qid} | SITE={cmd.site_code} | REPORT={rep} | TYPE=NEW_WORK",
+                                            f"CONFIRM {item.qid} | SITE={cmd.site_code} | REPORT={rep} | TYPE=REDEC",
+                                            f"REJECT {item.qid}",
+                                        ]
+                                        drafted = _draft_confirmation_via_llm(
+                                            settings=self.settings,
+                                            subject=subject,
+                                            situation="This site code is not in my database yet. I can still ingest this report (even if it's report 9), but I need you to confirm the site code and the project type so I can create the site first.",
+                                            hints={
+                                                "Quarantine ID": item.qid,
+                                                "Site code": cmd.site_code,
+                                                "Report reference": rep,
+                                                "Project type options": "NEW_WORK or REDEC",
+                                            },
+                                            confirm_lines=confirm_lines,
+                                        )
+                                        reply_text = drafted or (
+                                            "NEW SITE (confirmation required)\n"
+                                            f"Quarantine ID: {item.qid}\n\n"
+                                            "Reply with ONE of these lines (copy/paste):\n"
+                                            + "\n".join(confirm_lines)
+                                            + "\n"
+                                        )
+                                    else:
+                                        rev = (cmd.arg or "REV01").strip().upper()
+                                        confirm_lines = [
+                                            f"CONFIRM {item.qid} | SITE={cmd.site_code} | REV={rev}",
+                                            f"REJECT {item.qid}",
+                                        ]
+                                        drafted = _draft_confirmation_via_llm(
+                                            settings=self.settings,
+                                            subject=subject,
+                                            situation="This site code is not in my database yet. Please confirm the site code so I can create the site and file this specification update.",
+                                            hints={
+                                                "Quarantine ID": item.qid,
+                                                "Site code": cmd.site_code,
+                                                "Spec revision": rev,
+                                            },
+                                            confirm_lines=confirm_lines,
+                                        )
+                                        reply_text = drafted or (
+                                            "NEW SITE (confirmation required)\n"
+                                            f"Quarantine ID: {item.qid}\n\n"
+                                            "Reply with ONE of these lines (copy/paste):\n"
+                                            + "\n".join(confirm_lines)
+                                            + "\n"
+                                        )
+
+                                else:
+                                    # Write to email_drop for ingestion (idempotent by sha)
+                                    drop = Path(self.settings.DATA_DIR) / "email_drop"
+                                    drop.mkdir(parents=True, exist_ok=True)
+                                    safe_name = f"{cmd.site_code}__{cmd.kind}__{p['sha'][:12]}__{p['name']}".replace("/", "_")
+                                    out_path = drop / safe_name
+                                    if not out_path.exists():
+                                        out_path.write_bytes(p["data"])
+
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=p["name"],
+                                        content_type=p["content_type"],
+                                        sha256=p["sha"],
+                                        stored_path=str(out_path),
+                                        quarantined=False,
+                                    )
+
+                                    # rc/out/vision_note are initialized at the start of this handler.
+
+                                    if cmd.kind == "SPEC_UPDATE":
+                                        spec = spec_svc.ingest_spec(
+                                            site_code=cmd.site_code,
+                                            version_label=cmd.arg or "REV01",
+                                            file_path=out_path,
+                                        )
+                                        # SPEC_UPDATE ends here (no report triage/vision).
+                                        reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
+                                    else:
+                                        rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
+                                        out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
+
+                                        # Always (re)triage so the reply reflects the latest deterministic issues/result.
+                                        try:
+                                            report_svc.triage_report_text(site_code=cmd.site_code, report_code=rc, reset=True)
+                                        except Exception:
+                                            pass
 
                                 # Always run Vision (if enabled + API key present)
+                                # Only valid for QA_REPORT flows where we have a report_code.
+                                # IMPORTANT: rc may be unset if we quarantined (unknown site) or on SPEC_UPDATE.
+                                rc = locals().get("rc")
                                 vision_note = ""
                                 vision_enabled = os.getenv("PETER_VISION_ENABLED", "").strip().lower() in ("1", "true", "yes")
-                                if vision_enabled:
+                                if vision_enabled and rc:
                                     try:
                                         out_v = report_svc.analyze_report_visuals(site_code=cmd.site_code, report_code=rc, reset=True)
                                         n = len(out_v.get("omission_issues_created") or [])
@@ -1367,6 +1739,9 @@ class EmailWatcher:
                                 # Gather any spec deviation issues that likely need technician confirmation.
                                 confirm_notes = ""
                                 try:
+                                    if not rc:
+                                        # No report_code -> nothing to confirm (likely SPEC_UPDATE or quarantined).
+                                        raise StopIteration
                                     row2 = conn.execute(
                                         """
                                         SELECT r.id
@@ -1536,10 +1911,17 @@ class EmailWatcher:
                                                     "- NEEDS MORE INFO: and what evidence is missing",
                                                 ]
                                                 confirm_notes = "\n".join(lines)
+                                except StopIteration:
+                                    confirm_notes = ""
                                 except Exception:
                                     confirm_notes = ""
 
                                 try:
+                                    # Drafting a QA reply only makes sense for QA_REPORT (needs report_code).
+                                    # If we already prepared a reply (e.g. quarantine/new-site confirmation), keep it.
+                                    if not rc:
+                                        raise StopIteration
+
                                     use_llm = os.getenv("PETER_EMAIL_DRAFT_USE_OPENAI", "").strip().lower() in ("1", "true", "yes")
                                     if use_llm and self.settings.OPENAI_API_KEY:
                                         from peter.interfaces.email.llm_reply import draft_email_reply_llm
@@ -1572,6 +1954,9 @@ class EmailWatcher:
                                             + (confirm_notes or "")
                                             + "\n"
                                         )
+                                except StopIteration:
+                                    # No report_code: keep the prebuilt reply_text (e.g. quarantine/new-site confirmation)
+                                    pass
                                 except Exception as e:
                                     # If OpenAI is down/quota exceeded, queue this report for reprocessing.
                                     if _is_openai_outage(e):
@@ -1612,7 +1997,14 @@ class EmailWatcher:
                                             f"- reference: {item.qid}\n"
                                         )
                                     else:
-                                        reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}" + vision_note
+                                        # Fallback: only if we actually ingested a report.
+                                        if out and isinstance(out, dict):
+                                            reply_text = (
+                                                f"OK report ingested site={cmd.site_code} report={rc} status={out.get('status')} report_id={out.get('report_id')}"
+                                                + vision_note
+                                            )
+                                        else:
+                                            reply_text = f"OK received {cmd.kind} for site={cmd.site_code}." 
 
                     elif cmd.kind == "QUERY":
                         if not cmd.site_code or not cmd.arg:

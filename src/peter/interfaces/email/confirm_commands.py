@@ -14,6 +14,17 @@ class ConfirmCommand:
     decision: str | None  # USED|NOT_USED|MORE_INFO
 
 
+def coerce_project_type(v: str | None) -> str | None:
+    if not v:
+        return None
+    vv = str(v).strip().upper().replace("-", "_").replace(" ", "")
+    if vv in ("NEW", "NEWWORK", "NEW_WORK", "NEWWORKS", "NEWBUILD", "NEW_BUILD"):
+        return "NEW_WORK"
+    if vv in ("REDEC", "REDECORATION", "REDECORATIONS", "REPAINT"):
+        return "REDEC"
+    return None
+
+
 def parse_confirm_subject(subject: str) -> ConfirmCommand:
     s = (subject or "").strip()
     if not s:
@@ -65,25 +76,51 @@ def parse_confirm_subject(subject: str) -> ConfirmCommand:
 def parse_confirm_freeform(subject: str, body: str) -> ConfirmCommand:
     """Parse free-text confirmation replies.
 
-    Supports replies where the subject is e.g. "Re: ..." but includes a QID,
-    and the body contains words like "confirm"/"reject" and optionally project type.
+    Important: replies often include quoted prior messages containing BOTH CONFIRM and REJECT options.
+    We therefore:
+    - Prefer an explicit command line in the *new* text (e.g. "CONFIRM Q-... | ...")
+    - Fall back to keyword inference only if no explicit command line is found.
     """
 
-    s = ((subject or "") + "\n" + (body or "")).strip()
+    subj = (subject or "").strip()
+    body0 = (body or "").strip()
+    s = (subj + "\n" + body0).strip()
     if not s:
         return ConfirmCommand("NONE", None, None, None, None, None)
 
+    # 1) Look for explicit command lines first (prefer CONFIRM if both appear)
+    cmd_lines = []
+    for ln in body0.splitlines():
+        lns = ln.strip()
+        if not lns:
+            continue
+        # Skip common quoted lines
+        if lns.startswith(">"):
+            continue
+        m = re.match(r"^(CONFIRM|REJECT)\s+(Q-\d{8}-\d{6}-[0-9a-fA-F]{4})\s*(?:\|\s*(.*))?$", lns, flags=re.I)
+        if m:
+            cmd_lines.append(lns)
+
+    for prefer in ("CONFIRM", "REJECT"):
+        for ln in cmd_lines:
+            if ln.upper().startswith(prefer + " "):
+                # Reuse the subject parser for consistent token parsing
+                return parse_confirm_subject(ln)
+
+    # 2) Otherwise, find a QID anywhere and infer kind/ptype/decision from keywords
     m = re.search(r"\b(Q-\d{8}-\d{6}-[0-9a-fA-F]{4})\b", s, flags=re.I)
     if not m:
         return ConfirmCommand("NONE", None, None, None, None, None)
     qid = m.group(1)
 
     low = s.lower()
+
+    # Determine kind (prefer CONFIRM if both present; avoid quoted option lists causing accidental REJECT)
     kind = "NONE"
-    if "reject" in low or "decline" in low:
-        kind = "REJECT"
-    elif "confirm" in low or "approved" in low or low.strip() in ("yes", "y"):
+    if "confirm" in low or "approved" in low or low.strip() in ("yes", "y"):
         kind = "CONFIRM"
+    elif "reject" in low or "decline" in low:
+        kind = "REJECT"
 
     # Project type inference from free text
     ptype = None

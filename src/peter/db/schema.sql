@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 7);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 8);
 
 CREATE TABLE IF NOT EXISTS sites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +122,23 @@ CREATE TABLE IF NOT EXISTS issue_confirmation_items (
 );
 CREATE INDEX IF NOT EXISTS idx_ici_conf_id ON issue_confirmation_items(confirmation_id);
 CREATE INDEX IF NOT EXISTS idx_ici_issue_id ON issue_confirmation_items(issue_id);
+
+CREATE TABLE IF NOT EXISTS material_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  report_id INTEGER NOT NULL,
+  page_number INTEGER,
+  product_code TEXT,
+  product_name TEXT,
+  brand TEXT,
+  batch_lot_candidate TEXT,
+  confidence REAL,
+  raw_text TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CONSTRAINT fk_me_report FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_me_report_id ON material_evidence(report_id);
+CREATE INDEX IF NOT EXISTS idx_me_product_code ON material_evidence(product_code);
+CREATE INDEX IF NOT EXISTS idx_me_batch ON material_evidence(batch_lot_candidate);
 
 CREATE TABLE IF NOT EXISTS feedback_signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -52,6 +52,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     if version < 7:
         _migrate_v6_to_v7(conn)
         conn.execute("UPDATE schema_version SET version = 7, applied_at = datetime('now') WHERE id = 1")
+        version = 7
+
+    # v8: material_evidence table
+    if version < 8:
+        _migrate_v7_to_v8(conn)
+        conn.execute("UPDATE schema_version SET version = 8, applied_at = datetime('now') WHERE id = 1")
 
 
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -60,6 +66,29 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     from peter.db.migrations_v4 import migrate
 
     migrate(conn)
+
+
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS material_evidence (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          report_id INTEGER NOT NULL,
+          page_number INTEGER,
+          product_code TEXT,
+          product_name TEXT,
+          brand TEXT,
+          batch_lot_candidate TEXT,
+          confidence REAL,
+          raw_text TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          CONSTRAINT fk_me_report FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_me_report_id ON material_evidence(report_id);
+        CREATE INDEX IF NOT EXISTS idx_me_product_code ON material_evidence(product_code);
+        CREATE INDEX IF NOT EXISTS idx_me_batch ON material_evidence(batch_lot_candidate);
+        """
+    )
 
 
 def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:

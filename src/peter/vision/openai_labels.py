@@ -53,30 +53,43 @@ def extract_label_products(*, api_key: str, model: str, page_number: int, image_
     Use on pages that likely contain product containers/labels.
     """
 
-    img_b64 = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+    b = Path(image_path).read_bytes()
+    img_b64 = base64.b64encode(b).decode("ascii")
+
+    # Correct MIME for the data URL (pages are usually PNG renders)
+    suf = str(Path(image_path).suffix or "").lower()
+    mime = "image/png" if suf == ".png" else "image/jpeg"
 
     prompt = (
-        "You are extracting paint product identifiers from images. "
-        "Look ONLY for paint drums/buckets/containers and read visible label text. "
-        "Return a JSON array of observed products. "
-        "For each item include raw_text, optional product_code (e.g. PP700/PU800) if clearly visible, optional brand, confidence, notes. "
-        "Do not invent codes. If nothing is visible, return an empty array."
+        "You are extracting paint product identifiers AND traceability sticker text from images. "
+        "Look for paint drums/buckets/containers and any barcode/lot/batch stickers on lids/labels. "
+        "Return a JSON array of observed products/containers. "
+        "For each item include raw_text (include any visible batch/lot/barcode printed text if readable), "
+        "optional product_code (e.g. PP700/PU800) if clearly visible, optional brand, confidence, notes. "
+        "Do not invent codes or numbers. If nothing is visible, return an empty array."
     )
 
     schema = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["raw_text", "confidence"],
-            "properties": {
-                "raw_text": {"type": "string"},
-                "product_code": {"type": ["string", "null"]},
-                "brand": {"type": ["string", "null"]},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "notes": {"type": "string"},
-            },
-        },
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["products"],
+        "properties": {
+            "products": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["raw_text", "product_code", "brand", "confidence", "notes"],
+                    "properties": {
+                        "raw_text": {"type": "string"},
+                        "product_code": {"type": ["string", "null"]},
+                        "brand": {"type": ["string", "null"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "notes": {"type": "string"},
+                    },
+                },
+            }
+        }
     }
 
     payload: dict[str, Any] = {
@@ -86,31 +99,51 @@ def extract_label_products(*, api_key: str, model: str, page_number: int, image_
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"},
+                    {"type": "input_image", "image_url": f"data:{mime};base64,{img_b64}"},
                 ],
             }
         ],
         "temperature": float(os.getenv("PETER_LABELS_TEMPERATURE", "0.0")),
-        "response_format": {"type": "json_schema", "json_schema": {"name": "label_products", "schema": schema}},
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "label_products",
+                "schema": schema,
+                "strict": True,
+            }
+        },
     }
 
     data = _post_responses(api_key=api_key, model=model, payload=payload)
 
+    out_json = None
     out_text = data.get("output_text")
     if not out_text:
         # fallback scan
         for item in data.get("output", []) or []:
             for c in item.get("content", []) or []:
+                if c.get("type") == "output_json" and "json" in c:
+                    out_json = c.get("json")
+                    break
                 if c.get("type") == "output_text" and c.get("text"):
                     out_text = c["text"]
-                    break
+            if out_json is not None:
+                break
 
-    if not out_text:
+    if out_json is None and not out_text:
         return []
 
-    try:
-        arr = json.loads(out_text)
-    except Exception:
+    obj = None
+    if out_json is not None:
+        obj = out_json
+    else:
+        try:
+            obj = json.loads(out_text)
+        except Exception:
+            return []
+
+    arr = obj.get("products") if isinstance(obj, dict) else None
+    if not isinstance(arr, list):
         return []
 
     prods: list[LabelProduct] = []

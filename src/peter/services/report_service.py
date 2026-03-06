@@ -582,6 +582,68 @@ class ReportService:
         pdf_path = (self.settings.QA_ROOT / stored_rel).resolve()
 
         pages_dir = sandbox.ensure_dir("03_reviews", f"{site.site_code}__{rc}__{sha[:12]}__pages")
+
+        # Extract report text early so we can infer material pages before rendering.
+        extracted_text = ""
+        txt_files = list(sandbox.build_path("00_admin").glob(f"{site.site_code}__REPORT__{rc}__{sha[:12]}*.txt"))
+        if txt_files:
+            extracted_text = txt_files[0].read_text(encoding="utf-8", errors="replace")
+
+        # Determine material-on-site pages early.
+        # Cache this per report SHA so retries don't keep re-inferring.
+        material_pages: set[int] = set()
+        cache_enabled = os.getenv("PETER_MATERIAL_PAGES_CACHE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+        material_cache_path = sandbox.build_path("03_reviews", f"{site.site_code}__{rc}__{sha[:12]}__material_pages.json")
+
+        if cache_enabled and (not reset) and material_cache_path.exists():
+            try:
+                cached = json.loads(material_cache_path.read_text(encoding="utf-8", errors="replace"))
+                mp = cached.get("material_pages") or []
+                material_pages = {int(x) for x in mp if str(x).isdigit()}
+            except Exception:
+                material_pages = set()
+
+        if not material_pages:
+            try:
+                if extracted_text:
+                    from peter.analysis.material_pages import infer_material_pages_from_text
+
+                    material_pages = infer_material_pages_from_text(extracted_text)
+            except Exception:
+                material_pages = set()
+
+        # Optional explicit page scoping (useful to avoid reprocessing entire reports).
+        # - PETER_VISION_PAGE_RANGE="30-33" (preferred)
+        # - PETER_VISION_FIRST_PAGE / PETER_VISION_LAST_PAGE
+        page_range_raw = os.getenv("PETER_VISION_PAGE_RANGE", "").strip()
+        first_page_env = os.getenv("PETER_VISION_FIRST_PAGE", "").strip()
+        last_page_env = os.getenv("PETER_VISION_LAST_PAGE", "").strip()
+
+        first_page = 1
+        last_page2: int | None = None
+
+        if page_range_raw:
+            try:
+                pr = page_range_raw.replace(" ", "")
+                if "-" in pr:
+                    a, b = pr.split("-", 1)
+                    first_page = max(1, int(a))
+                    last_page2 = max(first_page, int(b))
+            except Exception:
+                first_page, last_page2 = 1, None
+        else:
+            if first_page_env:
+                try:
+                    first_page = max(1, int(first_page_env))
+                except Exception:
+                    first_page = 1
+            if last_page_env:
+                try:
+                    last_page2 = max(1, int(last_page_env))
+                except Exception:
+                    last_page2 = None
+
+        # Back-compat: cap total pages when no explicit page range was provided.
         max_pages_raw = os.getenv("PETER_VISION_MAX_PAGES", "").strip().lower()
         max_pages = None
         if max_pages_raw and max_pages_raw not in ("all", "0", "none"):
@@ -590,27 +652,28 @@ class ReportService:
             except Exception:
                 max_pages = None
 
-        last_page = None
-        if max_pages is not None:
-            last_page = max_pages
+        if page_range_raw == "" and last_page2 is None and max_pages is not None:
+            last_page2 = max_pages
+
+        # If enabled, restrict Vision runs to the material-on-site section only,
+        # but only when an explicit page range was not provided.
+        material_only = os.getenv("PETER_VISION_MATERIAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+        if page_range_raw == "" and material_only and material_pages:
+            first_page = min(material_pages)
+            last_page2 = max(material_pages)
 
         rendered = render_pdf_pages(
             pdf_path,
             out_dir=pages_dir,
             prefix=f"{site.site_code}__{rc}__{sha[:12]}",
             dpi=300,
-            first_page=1,
-            last_page=last_page,
+            first_page=first_page,
+            last_page=last_page2,
         )
 
         api_key = self.settings.OPENAI_API_KEY
         model = os.getenv("PETER_VISION_MODEL", "gpt-4.1")
-
-        # Extract defects mentioned in text (canonical taxonomy)
-        extracted_text = ""
-        txt_files = list(sandbox.build_path("00_admin").glob(f"{site.site_code}__REPORT__{rc}__{sha[:12]}*.txt"))
-        if txt_files:
-            extracted_text = txt_files[0].read_text(encoding="utf-8", errors="replace")
 
         from peter.analysis.text_defects import extract_text_defects
 
@@ -623,7 +686,63 @@ class ReportService:
         # Optional: label-focused extraction pass on pages with labels.
         labels_enabled = os.getenv("PETER_LABELS_FOCUSED_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 
-        for idx, img_path in enumerate(rendered.page_paths, start=1):
+        # Optional fast path: labels-only on specified pages.
+        # Example:
+        #   PETER_MATERIAL_PAGES="30-33"
+        #   PETER_MATERIAL_LABELS_ONLY=1
+        material_pages_override: set[int] = set()
+        material_pages_raw = os.getenv("PETER_MATERIAL_PAGES", "").strip()
+        if material_pages_raw:
+            try:
+                mpr = material_pages_raw.replace(" ", "")
+                if "-" in mpr:
+                    a, b = mpr.split("-", 1)
+                    a_i, b_i = int(a), int(b)
+                    if a_i > 0 and b_i > 0:
+                        material_pages_override = set(range(min(a_i, b_i), max(a_i, b_i) + 1))
+            except Exception:
+                material_pages_override = set()
+
+        material_labels_only = os.getenv("PETER_MATERIAL_LABELS_ONLY", "0").strip().lower() in ("1", "true", "yes")
+
+        for img_path in rendered.page_paths:
+            # Rendered filenames are like <prefix>-<pdf_page>.png
+            try:
+                idx = int(Path(img_path).stem.split("-")[-1])
+            except Exception:
+                idx = 0
+            if idx <= 0:
+                continue
+
+            material_page = (idx in material_pages_override) or (idx in material_pages)
+
+            if material_labels_only and material_page:
+                # Skip full defect vision; only do label extraction.
+                observed_products = []
+                try:
+                    audit = audit_page_image(api_key=api_key, model=model, page_number=idx, image_path=img_path)
+                    if audit.has_labels_or_callouts:
+                        from peter.vision.openai_labels import extract_label_products
+
+                        lp = extract_label_products(api_key=api_key, model=model, page_number=idx, image_path=img_path)
+                        observed_products = [p.__dict__ for p in lp]
+                except Exception as e:
+                    vision_results.append({"page": idx, "error": f"labels-only failed: {str(e)[:1800]}"})
+                    continue
+
+                # Deduplicate observed products by raw_text+code
+                dedup = []
+                seen = set()
+                for op in observed_products:
+                    key = (str(op.get('raw_text') or '').strip().upper(), str(op.get('product_code') or '').strip().upper())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    dedup.append(op)
+
+                vision_results.append({"page": idx, "summary": "(labels-only)", "findings": [], "observed_products": dedup})
+                continue
+
             try:
                 vr = analyze_page_image(api_key=api_key, model=model, page_number=idx, image_path=img_path)
             except VisionError as e:
@@ -644,12 +763,35 @@ class ReportService:
                 except Exception:
                     pass
 
+            # Force a label-focused extraction pass on material-on-site pages.
+            # This catches batch/product evidence even when the main pass misses it.
+            if idx in material_pages:
+                try:
+                    from peter.vision.openai_labels import extract_label_products
+
+                    lp = extract_label_products(api_key=api_key, model=model, page_number=idx, image_path=img_path)
+                    log.warning("material labels page=%s extracted=%s", idx, len(lp))
+                    observed_products.extend([p.__dict__ for p in lp])
+                except Exception as e:
+                    log.warning("labels extract failed page=%s err=%s", idx, str(e)[:200])
+                    pass
+
+            # Deduplicate observed products by raw_text+code
+            dedup = []
+            seen = set()
+            for op in observed_products:
+                key = (str(op.get('raw_text') or '').strip().upper(), str(op.get('product_code') or '').strip().upper())
+                if key in seen:
+                    continue
+                seen.add(key)
+                dedup.append(op)
+
             vision_results.append(
                 {
                     "page": idx,
                     "summary": vr.summary,
                     "findings": [f.__dict__ for f in vr.findings],
-                    "observed_products": observed_products,
+                    "observed_products": dedup,
                 }
             )
 
@@ -698,10 +840,70 @@ class ReportService:
                     if CanonicalDefect.DAMPNESS_MOULD_ALGAE in canonical and conf >= 0.80:
                         moisture_findings.append((idx, f))
 
-        # Persist vision artifact
+        # Persist inferred material page mapping (cached per report SHA)
+        material_name = f"{site.site_code}__{rc}__{sha[:12]}__material_pages.json"
+        material_path = sandbox.build_path("03_reviews", material_name)
+        try:
+            mp_sorted = sorted(list(material_pages))
+            payload = {
+                "report_id": report_id,
+                "site_code": site.site_code,
+                "report_code": rc,
+                "sha256": sha,
+                "material_pages": mp_sorted,
+                "range": {"first": (min(mp_sorted) if mp_sorted else None), "last": (max(mp_sorted) if mp_sorted else None)},
+                "source": "infer_material_pages_from_text",
+            }
+            material_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception:
+            # best-effort cache
+            pass
+
+        # Persist vision artifact (include material_pages for downstream consumers)
         vision_name = f"{site.site_code}__{rc}__{sha[:12]}__vision.json"
         vision_path = sandbox.build_path("03_reviews", vision_name)
-        vision_path.write_text(json.dumps({"report_id": report_id, "pages": vision_results}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        vision_path.write_text(
+            json.dumps(
+                {
+                    "report_id": report_id,
+                    "pages": vision_results,
+                    "material_pages": sorted(list(material_pages)),
+                    "material_pages_json": str(material_path),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Material evidence: store batch/lot candidates from label raw text on material pages.
+        try:
+            from peter.analysis.batch_candidates import extract_batch_candidates
+
+            # Clear existing evidence for idempotency when reset=True
+            self.conn.execute("DELETE FROM material_evidence WHERE report_id = ?", (report_id,))
+
+            for pr in vision_results:
+                page_num = int(pr.get("page") or pr.get("page_number") or 0) or 0
+                if material_pages and page_num not in material_pages:
+                    continue
+                for op in pr.get("observed_products") or []:
+                    raw = str(op.get("raw_text") or "")
+                    conf = float(op.get("confidence") or 0.0)
+                    brand = str(op.get("brand") or "") or None
+                    pcode = (str(op.get("product_code") or "").strip().upper().replace(" ", "") or None)
+                    for cand in extract_batch_candidates(raw):
+                        self.conn.execute(
+                            """
+                            INSERT INTO material_evidence(
+                              report_id, page_number, product_code, product_name, brand, batch_lot_candidate, confidence, raw_text
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            """,
+                            (report_id, page_num, pcode, None, brand, cand, conf, raw[:1200]),
+                        )
+        except Exception:
+            pass
 
         # Spec compliance: compare observed paint products (label text) against active spec allowlist.
         try:
@@ -836,6 +1038,8 @@ class ReportService:
         return {
             "report_id": report_id,
             "vision_json": str(vision_path),
+            "material_pages_json": str(material_path),
+            "material_pages": sorted(list(material_pages)),
             "omission_issues_created": created_issue_ids,
             "overall_result_set": "WARN" if created_issue_ids else None,
         }

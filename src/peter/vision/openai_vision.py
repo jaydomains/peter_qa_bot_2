@@ -116,7 +116,7 @@ def analyze_page_image(
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["raw_text", "confidence"],
+                    "required": ["raw_text", "product_code", "brand", "confidence", "notes"],
                     "properties": {
                         "raw_text": {"type": "string"},
                         "product_code": {"type": ["string", "null"]},
