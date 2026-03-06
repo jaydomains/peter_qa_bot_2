@@ -1260,6 +1260,54 @@ class EmailWatcher:
 
                                 # Compose a human-like operational reply.
                                 # Prefer LLM drafting if enabled; fall back to heuristic ask.
+
+                                # Gather any spec deviation issues that likely need technician confirmation.
+                                confirm_notes = ""
+                                try:
+                                    row2 = conn.execute(
+                                        """
+                                        SELECT r.id
+                                        FROM reports r
+                                        JOIN sites s ON s.id = r.site_id
+                                        WHERE s.site_code = ? AND r.report_code = ?
+                                        ORDER BY r.received_at DESC
+                                        LIMIT 1
+                                        """,
+                                        (cmd.site_code.strip().upper(), rc),
+                                    ).fetchone()
+                                    if row2:
+                                        rid2 = int(row2["id"])
+                                        devs = conn.execute(
+                                            """
+                                            SELECT severity, category, description
+                                            FROM issues
+                                            WHERE report_id = ? AND issue_type = 'SPEC_DEVIATION'
+                                            ORDER BY created_at DESC
+                                            LIMIT 20
+                                            """,
+                                            (rid2,),
+                                        ).fetchall()
+                                        if devs:
+                                            lines = [
+                                                "\n\nCONFIRMATION REQUEST (internal)",
+                                                "We detected potential spec deviations from on-site labels/photos.",
+                                                "Some may be empty drums/decanting. Please confirm.",
+                                            ]
+                                            for d in devs[:10]:
+                                                cat = str(d["category"])
+                                                sev = str(d["severity"])
+                                                desc = str(d["description"] or "")
+                                                lines.append(f"- [{sev}] {cat}: {desc[:180]}")
+                                            lines += [
+                                                "\nReply with one of:",
+                                                "- CONFIRM: Used / applied",
+                                                "- CONFIRM: Not used (empty drums / decanting)",
+                                                "- NEEDS MORE INFO: and what evidence is missing",
+                                            ]
+                                            confirm_notes = "\n".join(lines)
+                                except Exception:
+                                    confirm_notes = ""
+
                                 try:
                                     use_llm = os.getenv("PETER_EMAIL_DRAFT_USE_OPENAI", "").strip().lower() in ("1", "true", "yes")
                                     if use_llm and self.settings.OPENAI_API_KEY:
@@ -1273,6 +1321,7 @@ class EmailWatcher:
                                             report_code=rc,
                                             vision_text=vision_note,
                                         )
+                                        reply_text = (reply_text or "").rstrip() + (confirm_notes or "") + "\n"
                                     else:
                                         from peter.interfaces.qa.ask import answer_report_question
 
@@ -1289,6 +1338,7 @@ class EmailWatcher:
                                                 mode="recommend",
                                             ).rstrip()
                                             + vision_note
+                                            + (confirm_notes or "")
                                             + "\n"
                                         )
                                 except Exception as e:

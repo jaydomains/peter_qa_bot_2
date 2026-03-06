@@ -155,6 +155,34 @@ class SpecService:
                     encoding="utf-8",
                 )
 
+                # Build a richer spec pack (spec type + product roles + role rules)
+                try:
+                    if os.getenv("PETER_SPEC_PACK_ENABLED", "1").strip().lower() in ("1", "true", "yes"):
+                        from peter.knowledge.spec_pack import extract_spec_pack
+
+                        pack = extract_spec_pack(spec_text=spec_text)
+                        pack_name = f"{site.site_code}__SPEC_PACK__{vlabel}__{sha[:12]}.json"
+                        pack_path = sandbox.build_path("00_admin", pack_name)
+                        pack_path.write_text(
+                            json.dumps(
+                                {
+                                    "site_code": site.site_code,
+                                    "version": vlabel,
+                                    "sha256": sha,
+                                    "spec_type": pack.spec_type,
+                                    "supplier_prefix": pack.supplier_prefix,
+                                    "allowed_products": pack.allowed_products,
+                                    "role_rules": pack.role_rules,
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                except Exception:
+                    pass
+
                 # Background prefetch: enqueue TDS fetches for new products (by code if available).
                 try:
                     from peter.knowledge.tds_queue import enqueue

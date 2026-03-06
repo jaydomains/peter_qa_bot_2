@@ -291,6 +291,7 @@ class ReportService:
 
         from peter.analysis.text_clean import clean_extracted_text
         from peter.analysis.summary_flags import build_flags, extract_section_excerpt
+        from peter.analysis.stage import infer_stage_from_text
 
         clean = clean_extracted_text(raw_text)
 
@@ -304,7 +305,12 @@ class ReportService:
         flags = build_flags(evidence_text)
 
         parts: list[str] = []
-        parts.append(f"REPORT SUMMARY (text-only)\nsite={site.site_code} report={rc} sha={sha}")
+        st = infer_stage_from_text(clean)
+        parts.append(
+            f"REPORT SUMMARY (text-only)\n"
+            f"site={site.site_code} report={rc} sha={sha}\n"
+            f"stage={st.stage} ({st.rationale})"
+        )
 
         ex = extract_section_excerpt(clean, "Executive Summary", window=700)
         if ex:
