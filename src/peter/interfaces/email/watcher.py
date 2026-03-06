@@ -1288,23 +1288,109 @@ class EmailWatcher:
                                             (rid2,),
                                         ).fetchall()
                                         if devs:
-                                            lines = [
-                                                "\n\nCONFIRMATION REQUEST (internal)",
-                                                "We detected potential spec deviations from on-site labels/photos.",
-                                                "Some may be empty drums/decanting. Please confirm.",
-                                            ]
-                                            for d in devs[:10]:
-                                                cat = str(d["category"])
-                                                sev = str(d["severity"])
-                                                desc = str(d["description"] or "")
-                                                lines.append(f"- [{sev}] {cat}: {desc[:180]}")
-                                            lines += [
-                                                "\nReply with one of:",
-                                                "- CONFIRM: Used / applied",
-                                                "- CONFIRM: Not used (empty drums / decanting)",
-                                                "- NEEDS MORE INFO: and what evidence is missing",
-                                            ]
-                                            confirm_notes = "\n".join(lines)
+                                            # Create a confirmation task (QID) and send a dedicated internal-only email
+                                            # to the technician sender + always-cc list.
+                                            try:
+                                                from peter.interfaces.email.quarantine_queue import new_quarantine_id
+
+                                                qid = new_quarantine_id()
+                                                prompt_lines = [
+                                                    "CONFIRMATION NEEDED (spec deviation / site stock)",
+                                                    f"Reference: {qid}",
+                                                    f"Site: {cmd.site_code}",
+                                                    f"Report: {rc}",
+                                                    "",
+                                                    "We detected potential spec deviations from on-site labels/photos.",
+                                                    "Some may be empty drums/decanting. Please confirm:",
+                                                    "",
+                                                ]
+                                                for d in devs[:10]:
+                                                    cat = str(d["category"])
+                                                    sev = str(d["severity"])
+                                                    desc = str(d["description"] or "")
+                                                    prompt_lines.append(f"- [{sev}] {cat}: {desc[:220]}")
+
+                                                prompt_lines += [
+                                                    "",
+                                                    "Reply with one of:",
+                                                    f"- CONFIRM {qid} | DECISION=USED",
+                                                    f"- CONFIRM {qid} | DECISION=NOT_USED",
+                                                    f"- CONFIRM {qid} | DECISION=MORE_INFO",
+                                                    f"- REJECT {qid}",
+                                                    "",
+                                                    "(Free text is OK too, e.g. 'Confirm Q-... not used, empty drums only')",
+                                                ]
+                                                prompt = "\n".join(prompt_lines) + "\n"
+
+                                                # Persist to DB so replies can be processed later.
+                                                try:
+                                                    conn.execute(
+                                                        """
+                                                        INSERT INTO issue_confirmations(email_event_id, report_id, qid, status, prompt)
+                                                        VALUES (?, ?, ?, 'PENDING', ?)
+                                                        """,
+                                                        (event_id, rid2, qid, prompt),
+                                                    )
+                                                except Exception:
+                                                    pass
+
+                                                # Send dedicated internal confirmation email (reply in-thread but recipients sanitized)
+                                                try:
+                                                    draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                                                    draft_id = draft["id"]
+
+                                                    # Subject tag
+                                                    graph.update_message(
+                                                        mailbox=self.settings.BOT_MAILBOX,
+                                                        message_id=draft_id,
+                                                        payload={"subject": f"CONFIRM {qid}"},
+                                                    )
+
+                                                    to_list, cc_list = build_sanitized_reply_recipients(
+                                                        internal_domain=self.settings.INTERNAL_DOMAIN,
+                                                        original_from=from_addr,
+                                                        original_to=to_addrs,
+                                                        original_cc=cc_addrs,
+                                                        bot_mailbox=self.settings.BOT_MAILBOX,
+                                                        forced_cc=list(self.settings.REVIEW_DLIST),
+                                                    )
+                                                    assert_internal_only(to_list, cc_list, internal_domain=self.settings.INTERNAL_DOMAIN)
+
+                                                    payload = {
+                                                        "toRecipients": [{"emailAddress": {"address": a}} for a in to_list],
+                                                        "ccRecipients": [{"emailAddress": {"address": a}} for a in cc_list],
+                                                        "body": {"contentType": "Text", "content": prompt},
+                                                    }
+                                                    graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload=payload)
+                                                    graph.send_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id)
+                                                except Exception:
+                                                    pass
+
+                                                # Also append a short note to the main reply so the thread shows it was requested.
+                                                confirm_notes = (
+                                                    "\n\nCONFIRMATION REQUEST (internal)\n"
+                                                    f"- reference: {qid}\n"
+                                                    "A confirmation request was sent to the reporting technician." 
+                                                )
+                                            except Exception:
+                                                # fallback to inline only
+                                                lines = [
+                                                    "\n\nCONFIRMATION REQUEST (internal)",
+                                                    "We detected potential spec deviations from on-site labels/photos.",
+                                                    "Some may be empty drums/decanting. Please confirm.",
+                                                ]
+                                                for d in devs[:10]:
+                                                    cat = str(d["category"])
+                                                    sev = str(d["severity"])
+                                                    desc = str(d["description"] or "")
+                                                    lines.append(f"- [{sev}] {cat}: {desc[:180]}")
+                                                lines += [
+                                                    "\nReply with one of:",
+                                                    "- CONFIRM: Used / applied",
+                                                    "- CONFIRM: Not used (empty drums / decanting)",
+                                                    "- NEEDS MORE INFO: and what evidence is missing",
+                                                ]
+                                                confirm_notes = "\n".join(lines)
                                 except Exception:
                                     confirm_notes = ""
 

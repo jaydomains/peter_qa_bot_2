@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 5);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 6);
 
 CREATE TABLE IF NOT EXISTS sites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +89,23 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 CREATE INDEX IF NOT EXISTS idx_issues_report_id ON issues(report_id);
 CREATE INDEX IF NOT EXISTS idx_issues_type_sev ON issues(issue_type, severity);
+
+CREATE TABLE IF NOT EXISTS issue_confirmations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email_event_id INTEGER,
+  report_id INTEGER,
+  qid TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('PENDING','CONFIRMED_USED','CONFIRMED_NOT_USED','NEEDS_MORE_INFO','REJECTED','CANCELLED')),
+  prompt TEXT,
+  response_text TEXT,
+  confirmed_by TEXT,
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CONSTRAINT fk_ic_email FOREIGN KEY (email_event_id) REFERENCES email_events(id) ON DELETE SET NULL,
+  CONSTRAINT fk_ic_report FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ic_report_id ON issue_confirmations(report_id);
+CREATE INDEX IF NOT EXISTS idx_ic_email_event_id ON issue_confirmations(email_event_id);
 
 CREATE TABLE IF NOT EXISTS feedback_signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
