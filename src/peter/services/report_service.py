@@ -419,6 +419,42 @@ class ReportService:
         except Exception:
             pass
 
+        # Role mismatch checks using spec pack (best-effort)
+        try:
+            # Resolve active spec pack path
+            sp = self.conn.execute(
+                """
+                SELECT sp.version_label, sp.sha256
+                FROM sites s
+                JOIN specs sp ON sp.id = s.active_spec_id
+                WHERE s.id = ?
+                """,
+                (site.id,),
+            ).fetchone()
+            if sp and sp["sha256"]:
+                vlabel = str(sp["version_label"])
+                ssha = str(sp["sha256"])
+                sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                pack_glob = f"{site.site_code}__SPEC_PACK__{vlabel}__{ssha[:12]}.json"
+                pack_path = sandbox.build_path("00_admin", pack_glob)
+                if pack_path.exists():
+                    from peter.analysis.role_mismatch import load_spec_pack, detect_role_mismatches
+
+                    pack = load_spec_pack(pack_path)
+                    if pack:
+                        finds = detect_role_mismatches(spec_pack=pack, report_text=clean)
+                        for f in finds:
+                            self.issue_repo.insert(
+                                report_id=report_id,
+                                issue_type="SPEC_DEVIATION",
+                                category=f.title,
+                                description=f.details,
+                                severity=f.severity,
+                                is_blocking=(f.severity in ("CRITICAL", "HIGH")),
+                            )
+        except Exception:
+            pass
+
         # Map deterministic flags to issue severity/blocking.
         # Keep it conservative; tune later.
         sev_map = {
