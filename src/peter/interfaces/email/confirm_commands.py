@@ -10,16 +10,17 @@ class ConfirmCommand:
     qid: str | None
     site: str | None
     report: str | None
+    project_type: str | None  # NEW_WORK|REDEC
 
 
 def parse_confirm_subject(subject: str) -> ConfirmCommand:
     s = (subject or "").strip()
     if not s:
-        return ConfirmCommand("NONE", None, None, None)
+        return ConfirmCommand("NONE", None, None, None, None)
 
     m = re.match(r"^(CONFIRM|REJECT)\s+(Q-\d{8}-\d{6}-[0-9a-fA-F]{4})\s*(?:\|\s*(.*))?$", s, flags=re.I)
     if not m:
-        return ConfirmCommand("NONE", None, None, None)
+        return ConfirmCommand("NONE", None, None, None, None)
 
     kind = m.group(1).upper()
     qid = m.group(2)
@@ -27,6 +28,7 @@ def parse_confirm_subject(subject: str) -> ConfirmCommand:
 
     site = None
     report = None
+    ptype = None
     if rest:
         # parse tokens like SITE=PRSVNQA | REPORT=006
         parts = [p.strip() for p in rest.split("|") if p.strip()]
@@ -40,5 +42,45 @@ def parse_confirm_subject(subject: str) -> ConfirmCommand:
                 site = v
             elif k in ("REPORT", "REF", "REPORTNO"):
                 report = v
+            elif k in ("TYPE", "PROJECT", "PROJECTTYPE"):
+                vv = v.replace("-", "_")
+                if vv in ("NEW", "NEWWORK", "NEW_WORK"):
+                    ptype = "NEW_WORK"
+                elif vv in ("REDEC", "REDECORATION", "REDECORATIONS"):
+                    ptype = "REDEC"
 
-    return ConfirmCommand(kind, qid, site, report)
+    return ConfirmCommand(kind, qid, site, report, ptype)
+
+
+def parse_confirm_freeform(subject: str, body: str) -> ConfirmCommand:
+    """Parse free-text confirmation replies.
+
+    Supports replies where the subject is e.g. "Re: ..." but includes a QID,
+    and the body contains words like "confirm"/"reject" and optionally project type.
+    """
+
+    s = ((subject or "") + "\n" + (body or "")).strip()
+    if not s:
+        return ConfirmCommand("NONE", None, None, None, None)
+
+    m = re.search(r"\b(Q-\d{8}-\d{6}-[0-9a-fA-F]{4})\b", s, flags=re.I)
+    if not m:
+        return ConfirmCommand("NONE", None, None, None, None)
+    qid = m.group(1)
+
+    low = s.lower()
+    kind = "NONE"
+    if "reject" in low or "decline" in low:
+        kind = "REJECT"
+    elif "confirm" in low or "approved" in low or low.strip() in ("yes", "y"):
+        kind = "CONFIRM"
+
+    # Project type inference from free text
+    ptype = None
+    if "redec" in low or "re-decoration" in low or "redecoration" in low:
+        ptype = "REDEC"
+    if "new work" in low or "newwork" in low or "new-build" in low or "new build" in low:
+        ptype = "NEW_WORK"
+
+    return ConfirmCommand(kind, qid, None, None, ptype)
+

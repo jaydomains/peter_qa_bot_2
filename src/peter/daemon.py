@@ -104,7 +104,15 @@ def process_inbox_once(*, settings: Settings) -> None:
                 t0 = time.monotonic()
                 log.info("INBOX spec: site=%s version=%s file=%s", site_code, version, str(path))
                 # Ensure site exists (idempotent if already created).
-                site_svc.get_site_or_raise(site_code)
+                try:
+                    site_svc.get_site_or_raise(site_code)
+                except Exception:
+                    auto = os.getenv("PETER_AUTO_CREATE_SITES", "").strip().lower() in ("1", "true", "yes")
+                    if not auto:
+                        raise
+                    # Create a placeholder site name (can be renamed later via admin tooling).
+                    site_svc.create_site(site_code=site_code, site_name=site_code)
+                    log.warning("AUTO-CREATED site from INBOX spec: %s", site_code)
                 spec_svc.ingest_spec(site_code=site_code, version_label=version, file_path=path)
 
                 dest = inbox / "processed" / "spec" / site_code / path.name
@@ -130,7 +138,14 @@ def process_inbox_once(*, settings: Settings) -> None:
             try:
                 t0 = time.monotonic()
                 log.info("INBOX report: site=%s ref=%s file=%s", site_code, inspection_ref, str(path))
-                site_svc.get_site_or_raise(site_code)
+                try:
+                    site_svc.get_site_or_raise(site_code)
+                except Exception:
+                    auto = os.getenv("PETER_AUTO_CREATE_SITES", "").strip().lower() in ("1", "true", "yes")
+                    if not auto:
+                        raise
+                    site_svc.create_site(site_code=site_code, site_name=site_code)
+                    log.warning("AUTO-CREATED site from INBOX report: %s", site_code)
 
                 out = report_svc.ingest_report(site_code=site_code, report_code=inspection_ref, file_path=path)
 

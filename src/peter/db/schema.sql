@@ -8,13 +8,17 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 3);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 5);
 
 CREATE TABLE IF NOT EXISTS sites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   site_code TEXT NOT NULL UNIQUE,
   site_name TEXT NOT NULL,
+  site_name_raw TEXT,
   address TEXT,
+  supplier_client TEXT,
+  contractor_on_site TEXT,
+  project_type TEXT CHECK (project_type IN ('NEW_WORK','REDEC')),
   folder_name TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -57,6 +61,13 @@ CREATE TABLE IF NOT EXISTS reports (
   result TEXT CHECK (result IN ('PASS','WARN','FAIL')),
   review_md_path TEXT,
   review_json_path TEXT,
+
+  observed_site_name_raw TEXT,
+  observed_site_name_display TEXT,
+  observed_address TEXT,
+  observed_supplier_client TEXT,
+  observed_contractor_on_site TEXT,
+
   UNIQUE(site_id, sha256),
   CONSTRAINT fk_reports_site FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE,
   CONSTRAINT fk_reports_spec FOREIGN KEY (spec_id_used) REFERENCES specs(id)
@@ -112,6 +123,15 @@ CREATE INDEX IF NOT EXISTS idx_email_received_at ON email_events(received_at);
 CREATE INDEX IF NOT EXISTS idx_email_site_id ON email_events(site_id);
 
 -- Email attachments (audit + idempotency)
+CREATE TABLE IF NOT EXISTS site_aliases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL,
+  alias_code TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CONSTRAINT fk_alias_site FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_site_alias_site_id ON site_aliases(site_id);
+
 CREATE TABLE IF NOT EXISTS email_attachments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email_event_id INTEGER NOT NULL,

@@ -81,13 +81,18 @@ def _build_evidence_pack(
     report_id = int(row["id"])
     report_code_db = (row["report_code"] or rc).strip()
 
+    # Include site name for human confirmation.
+    site_row = conn.execute("SELECT site_name FROM sites WHERE site_code=?", (sc,)).fetchone()
+    site_name = str(site_row["site_name"] if site_row and site_row["site_name"] else "").strip()
+
     meta = (
-        f"site={sc}\n"
-        f"report_code={report_code_db}\n"
-        f"received_at={row['received_at']}\n"
-        f"result={row['result']}\n"
-        f"sha256={row['sha256']}\n"
-        f"stored_path={row['stored_path']}\n"
+        f"project_reference={sc}\n"
+        + (f"project_name={site_name}\n" if site_name else "")
+        + f"report_code={report_code_db}\n"
+        + f"received_at={row['received_at']}\n"
+        + f"result={row['result']}\n"
+        + f"sha256={row['sha256']}\n"
+        + f"stored_path={row['stored_path']}\n"
     )
 
     # Executive summary excerpt (reuse existing summary generator)
@@ -176,6 +181,7 @@ def draft_email_reply_llm(
         "If something is not explicitly supported by evidence, say you cannot confirm it. "
         "Write like a competent human QA reviewer: specific, decisive, and practical. "
         "Be more helpful than a summary: interpret what the findings imply for warranty/compliance and what evidence is required next. "
+        "Use client-safe language where possible (avoid jargon like 'blocking issues'; use 'Critical (Immediate action required)' instead). "
         "Scope: paint only (ignore repair materials unless directly relevant to paint performance). "
         "Always include a short EVIDENCE section at the end listing which sources you relied on."
     )
@@ -196,15 +202,19 @@ def draft_email_reply_llm(
         "--- VISION ---\n"
         f"{pack.vision}\n\n"
         "OUTPUT REQUIREMENTS:\n"
-        "- Start with: OVERALL STATUS: PASS/WARN/FAIL (choose based on evidence; if result in metadata is set, respect it)\n"
-        "- Then: Key findings (bullets).\n"
-        "  - You MUST explicitly address EVERY item in BLOCKING_ISSUES, even if the executive summary does not mention it.\n"
-        "  - For each key finding, cite source inline: (Source: EXEC_SUMMARY) or (Source: BLOCKING_ISSUES) or (Source: OTHER_ISSUES) or (Source: VISION pX).\n"
+        "- Start with: PROJECT: <reference> — <name if available>\n"
+        "- Then: OVERALL STATUS: PASS/WARN/FAIL (choose based on evidence; if result in metadata is set, respect it)\n"
+        "- Then: Critical findings (Immediate action required) (bullets).\n"
+        "  - You MUST explicitly address EVERY item in BLOCKING_ISSUES, but refer to them as 'Critical findings'.\n"
+        "- Then: Other findings (non-critical) (bullets).\n"
         "- Then: Required actions (bullets).\n"
-        "  - Each blocking issue must have at least one required action tied to it.\n"
-        "  - If the blocking issue is a spec deviation/coating system mismatch, include a warranty/compliance implication and request for evidence (invoices/POs/photos/logs).\n"
+        "  - Each critical finding must have at least one required action tied to it.\n"
+        "  - If the critical finding is a spec deviation/coating system mismatch, include a warranty/compliance implication and request for evidence (invoices/POs/photos/logs).\n"
+        "- Add a section: VISUAL ANALYSIS (short bullets).\n"
+        "  - If VISION evidence is '(not available)', say it was not available.\n"
+        "- Add a section at the end: REPORT SUMMARY (short paragraph in plain English).\n"
         "- If DEPTH is deep: include a short 'What to verify next visit' section.\n"
-        "- End with: EVIDENCE (short list of what you used).\n"
+        "- End with: EVIDENCE (short list of what you used; include report code(s)).\n"
     )
 
     return ask_openai_responses(api_key=api_key, model=model, system=system, user=user).strip() + "\n"

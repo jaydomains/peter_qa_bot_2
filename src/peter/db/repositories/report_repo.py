@@ -60,14 +60,21 @@ class ReportRepository:
         result: str | None,
         review_md_path: str | None,
         review_json_path: str | None,
+        observed_site_name_raw: str | None = None,
+        observed_site_name_display: str | None = None,
+        observed_address: str | None = None,
+        observed_supplier_client: str | None = None,
+        observed_contractor_on_site: str | None = None,
     ) -> int:
         cur = self.conn.execute(
             """
             INSERT INTO reports (
               site_id, report_code, filename, sha256, stored_path,
-              result, review_md_path, review_json_path
+              result, review_md_path, review_json_path,
+              observed_site_name_raw, observed_site_name_display, observed_address,
+              observed_supplier_client, observed_contractor_on_site
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -78,6 +85,11 @@ class ReportRepository:
                 result,
                 review_md_path,
                 review_json_path,
+                observed_site_name_raw,
+                observed_site_name_display,
+                observed_address,
+                observed_supplier_client,
+                observed_contractor_on_site,
             ),
         )
         return int(cur.lastrowid)

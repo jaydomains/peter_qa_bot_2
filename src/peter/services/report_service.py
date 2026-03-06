@@ -189,6 +189,15 @@ class ReportService:
             extracted_rel = str(txt_path.relative_to(self.settings.QA_ROOT))
 
         stored_rel = str(stored_pdf.relative_to(self.settings.QA_ROOT))
+        # Extract observed identity fields from the PDF (for history + cross-checks)
+        ident = None
+        try:
+            from peter.interfaces.email.report_identity import infer_from_pdf_bytes
+
+            ident = infer_from_pdf_bytes(stored_pdf.read_bytes())
+        except Exception:
+            ident = None
+
         report_id = self.report_repo.insert(
             site_id=site.id,
             report_code=rc,
@@ -198,7 +207,35 @@ class ReportService:
             result=None,
             review_md_path=None,
             review_json_path=None,
+            observed_site_name_raw=(ident.site_name_raw if ident else None),
+            observed_site_name_display=(ident.site_name_display if ident else None),
+            observed_address=(ident.address if ident else None),
+            observed_supplier_client=(ident.supplier_client if ident else None),
+            observed_contractor_on_site=(ident.contractor_on_site if ident else None),
         )
+
+        # Update latest-known site metadata (best-effort)
+        try:
+            if ident:
+                self.conn.execute(
+                    """
+                    UPDATE sites
+                    SET site_name_raw = COALESCE(site_name_raw, ?),
+                        address = COALESCE(address, ?),
+                        supplier_client = COALESCE(supplier_client, ?),
+                        contractor_on_site = COALESCE(contractor_on_site, ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        (ident.site_name_raw or None),
+                        (ident.address or None),
+                        (ident.supplier_client or None),
+                        (ident.contractor_on_site or None),
+                        site.id,
+                    ),
+                )
+        except Exception:
+            pass
 
         return {
             "status": "ok",

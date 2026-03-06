@@ -10,7 +10,7 @@ from typing import Any
 @dataclass(frozen=True)
 class QuarantineItem:
     qid: str
-    status: str  # PENDING_CONFIRMATION|CONFIRMED|REJECTED
+    status: str  # PENDING_CONFIRMATION|CONFIRMED|REJECTED|PENDING_API|PROCESSED
     created_at: str
     meta_path: Path
     file_path: Path
@@ -94,3 +94,32 @@ def update_status(*, item: QuarantineItem, status: str, extra: dict[str, Any] | 
     if extra:
         meta.update(extra)
     item.meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def list_items(*, data_dir: Path, status: str, limit: int = 20) -> list[QuarantineItem]:
+    root = quarantine_root(Path(data_dir))
+    if not root.exists():
+        return []
+
+    out: list[QuarantineItem] = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        meta_path = d / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(meta.get("status") or "").strip().upper() != status.strip().upper():
+            continue
+        try:
+            item = load_quarantine_item(data_dir=Path(data_dir), qid=d.name)
+            out.append(item)
+        except Exception:
+            continue
+        if len(out) >= max(1, int(limit)):
+            break
+
+    return out

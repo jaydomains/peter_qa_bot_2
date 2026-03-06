@@ -28,6 +28,32 @@ def init_db(conn: sqlite3.Connection) -> None:
     if version < 3:
         _migrate_v2_to_v3(conn)
         conn.execute("UPDATE schema_version SET version = 3, applied_at = datetime('now') WHERE id = 1")
+        version = 3
+
+    # v4: site identity fields + site_aliases + report observed identity
+    if version < 4:
+        _migrate_v3_to_v4(conn)
+        conn.execute("UPDATE schema_version SET version = 4, applied_at = datetime('now') WHERE id = 1")
+        version = 4
+
+    # v5: add sites.project_type
+    if version < 5:
+        _migrate_v4_to_v5(conn)
+        conn.execute("UPDATE schema_version SET version = 5, applied_at = datetime('now') WHERE id = 1")
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Migration: add site identity fields + report observed identity + site_aliases."""
+
+    from peter.db.migrations_v4 import migrate
+
+    migrate(conn)
+
+
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sites)").fetchall()}
+    if "project_type" not in cols:
+        conn.execute("ALTER TABLE sites ADD COLUMN project_type TEXT")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:

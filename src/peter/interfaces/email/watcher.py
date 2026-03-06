@@ -22,8 +22,9 @@ from peter.db.schema import init_db
 from peter.db.repositories.email_repo import EmailEventRepository
 from peter.db.repositories.site_repo import SiteRepository
 from peter.interfaces.email.classifier import parse_subject
-from peter.interfaces.email.confirm_commands import parse_confirm_subject
-from peter.interfaces.email.quarantine_queue import load_quarantine_item, save_quarantine_item, update_status
+from peter.interfaces.email.confirm_commands import parse_confirm_subject, parse_confirm_freeform
+from peter.interfaces.qa.openai_ask import ask_openai_responses
+from peter.interfaces.email.quarantine_queue import load_quarantine_item, save_quarantine_item, update_status, list_items
 from peter.interfaces.email.report_identity import infer_from_pdf_bytes
 from peter.interfaces.email.graph_auth import client_credentials_token
 from peter.interfaces.email.graph_client import GraphClient
@@ -189,6 +190,107 @@ def _extract_addrs(msg: dict[str, Any], field: str) -> list[str]:
     return out
 
 
+def _normalize_subject_key(s: str) -> str:
+    # Uppercase, keep alnum only.
+    return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
+
+
+def _infer_site_code_from_subject(*, subject: str, site_repo: SiteRepository) -> str | None:
+    """Infer a known site_code from the subject by scanning for any existing code.
+
+    This avoids guessing formats. It works as long as the subject contains the code
+    as a contiguous token (case-insensitive), even if punctuation is used.
+    """
+    subj_key = _normalize_subject_key(subject)
+    if not subj_key:
+        return None
+
+    try:
+        sites = site_repo.list_all()
+    except Exception:
+        sites = []
+
+    # Prefer longest codes first to avoid partial matches.
+    codes = sorted({s.site_code for s in sites if getattr(s, "site_code", None)}, key=lambda x: -len(x))
+    for code in codes:
+        ck = _normalize_subject_key(code)
+        if ck and ck in subj_key:
+            return str(code).strip().upper()
+    return None
+
+
+def _is_openai_outage(exc: BaseException) -> bool:
+    """Return True if this looks like a transient OpenAI outage/quota/rate-limit.
+
+    We use urllib-based calls (see AskLLMError) so errors are mostly strings.
+    Keep this conservative: only treat known transient conditions as outage.
+    """
+
+    msg = (str(exc) or "").lower()
+
+    # Try to extract HTTP code from common message formats.
+    # Example: "Ask request failed: HTTP 429 Too Many Requests ..."
+    m = re.search(r"\bhttp\s+(\d{3})\b", msg)
+    code = int(m.group(1)) if m else None
+
+    if code in (408, 409, 425, 429, 500, 502, 503, 504):
+        return True
+
+    needles = [
+        "insufficient_quota",
+        "quota exceeded",
+        "insufficient quota",
+        "rate limit",
+        "too many requests",
+        "temporarily unavailable",
+        "service unavailable",
+        "gateway timeout",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection error",
+        "name or service not known",
+        "temporary failure in name resolution",
+    ]
+    return any(n in msg for n in needles)
+
+
+def _friendly_error_via_llm(*, settings: Settings, subject: str, body: str, error_id: str, exc: BaseException) -> str | None:
+    enabled = os.getenv("PETER_EMAIL_FRIENDLY_ERRORS", "1").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return None
+    api_key = (settings.OPENAI_API_KEY or "").strip()
+    if not api_key:
+        return None
+
+    system = (
+        "You are PETER, an internal QA assistant. Rewrite internal system errors into a polite, clear message for technicians. "
+        "Do NOT include stack traces, code, or secrets. "
+        "Explain what went wrong in plain language and give exact next steps. "
+        "If a site code is missing/unknown, instruct them how to format the subject. "
+        "End with 'Reference: <error_id>' so support can trace it."
+    )
+
+    user = (
+        f"EMAIL SUBJECT: {subject}\n\n"
+        f"EMAIL BODY (excerpt):\n{(body or '')[:1200]}\n\n"
+        f"ERROR_ID: {error_id}\n"
+        f"EXCEPTION_TYPE: {type(exc).__name__}\n"
+        f"EXCEPTION_MESSAGE: {str(exc)[:500]}\n\n"
+        "Write the technician-facing reply."
+    )
+
+    try:
+        return ask_openai_responses(
+            api_key=api_key,
+            model=os.getenv("PETER_EMAIL_ERROR_MODEL", "gpt-4.1"),
+            system=system,
+            user=user,
+        ).strip() + "\n"
+    except Exception:
+        return None
+
+
 def _has_external(addrs: list[str], *, internal_domain: str) -> bool:
     dom = internal_domain.lower()
     for a in addrs or []:
@@ -226,6 +328,96 @@ class EmailWatcher:
 
             msgs = graph.list_unread_messages(mailbox=self.settings.BOT_MAILBOX, top=10)
             stats: dict[str, Any] = {"unread": len(msgs), "processed": 0, "commands": {}}
+            # Process any queued items from prior OpenAI outages (best-effort)
+            try:
+                if os.getenv("PETER_API_QUEUE_ENABLED", "1").strip().lower() in ("1", "true", "yes"):
+                    for it in list_items(data_dir=Path(self.settings.DATA_DIR), status="PENDING_API", limit=3):
+                        try:
+                            sc = str(it.meta.get("site_code") or "").strip().upper()
+                            rc = str(it.meta.get("report_code") or "").strip().upper()
+                            msg_id = str(it.meta.get("graph_message_id") or "").strip()
+                            if not (sc and rc and msg_id):
+                                update_status(item=it, status="FAILED", extra={"error": "missing meta"})
+                                continue
+
+                            # Backoff
+                            retry_count = int(it.meta.get("retry_count") or 0)
+                            last_retry_at = str(it.meta.get("last_retry_at") or "").strip()
+                            base = int(os.getenv("PETER_API_QUEUE_BACKOFF_SECONDS", "60"))
+                            cap = int(os.getenv("PETER_API_QUEUE_BACKOFF_MAX_SECONDS", "1800"))
+                            wait_s = min(cap, base * (2 ** min(retry_count, 6)))
+                            if last_retry_at:
+                                try:
+                                    # last_retry_at stored as '%Y-%m-%d %H:%M:%S'
+                                    import datetime as _dt
+                                    t0 = _dt.datetime.strptime(last_retry_at, "%Y-%m-%d %H:%M:%S")
+                                    if (_dt.datetime.utcnow() - t0).total_seconds() < wait_s:
+                                        continue
+                                except Exception:
+                                    pass
+
+                            # Try to draft the final reply now.
+                            vision_note = ""
+                            if os.getenv("PETER_VISION_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+                                try:
+                                    out_v = report_svc.analyze_report_visuals(site_code=sc, report_code=rc, reset=True)
+                                    n = len(out_v.get("omission_issues_created") or [])
+                                    vision_json = out_v.get("vision_json")
+                                    vision_note = (
+                                        "\n\nVISUAL ANALYSIS (auto)\n"
+                                        f"- omissions flagged: {n}\n"
+                                        f"- artifact: {vision_json}\n"
+                                    )
+                                except Exception:
+                                    pass
+
+                            from peter.interfaces.email.llm_reply import draft_email_reply_llm
+
+                            final_text = draft_email_reply_llm(
+                                conn=conn,
+                                settings=self.settings,
+                                site_code=sc,
+                                report_code=rc,
+                                vision_text=vision_note,
+                            )
+
+                            # Send follow-up reply in-thread
+                            draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=msg_id)
+                            draft_id = draft["id"]
+                            payload = {
+                                "body": {"contentType": "Text", "content": final_text},
+                            }
+                            graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload=payload)
+                            graph.send_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id)
+
+                            update_status(
+                                item=it,
+                                status="PROCESSED",
+                                extra={
+                                    "processed_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                                    "retry_count": int(it.meta.get("retry_count") or 0),
+                                },
+                            )
+                        except Exception as e:
+                            # Update retry metadata
+                            try:
+                                update_status(
+                                    item=it,
+                                    status="PENDING_API" if _is_openai_outage(e) else "FAILED",
+                                    extra={
+                                        "retry_count": int(it.meta.get("retry_count") or 0) + 1,
+                                        "last_retry_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                                        "last_error": str(e)[:300],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            if _is_openai_outage(e):
+                                continue
+                            update_status(item=it, status="FAILED", extra={"error": str(e)[:300]})
+            except Exception:
+                pass
+
             for m in msgs:
                 mid = m["id"]
                 # Dedupe: if we've seen this graph_message_id, skip.
@@ -252,8 +444,19 @@ class EmailWatcher:
                 except Exception:
                     pass
 
-                # Handle quarantine confirmation commands first (subject-based)
+                # Handle quarantine confirmation commands first.
                 conf = parse_confirm_subject(subject)
+                if conf.kind == "NONE":
+                    # Free-text confirmations: look for QID + confirm/reject/type in the email body.
+                    try:
+                        full0 = graph.get_message(mailbox=self.settings.BOT_MAILBOX, message_id=mid, select="body")
+                        body0 = str(((full0.get("body") or {}).get("content") or "")).strip()
+                    except Exception:
+                        body0 = ""
+                    conf2 = parse_confirm_freeform(subject, body0)
+                    if conf2.kind in ("CONFIRM", "REJECT") and conf2.qid:
+                        conf = conf2
+
                 if conf.kind in ("CONFIRM", "REJECT") and conf.qid:
                     from_addr_cmd = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
                     try:
@@ -282,6 +485,65 @@ class EmailWatcher:
                         rep = (conf.report or str(item.meta.get("detected_report") or "")).strip().upper()
                         rep = rep.replace("R", "") if rep.startswith("R") and rep[1:].isdigit() else rep
                         rep = rep.zfill(3) if rep.isdigit() else rep
+
+                        # Project type confirmation (once per site)
+                        require_ptype = bool(item.meta.get("require_project_type"))
+                        ptype = (conf.project_type or str(item.meta.get("project_type") or "").strip().upper().replace("-", "_"))
+                        if ptype in ("NEW", "NEWWORK"):
+                            ptype = "NEW_WORK"
+                        if require_ptype and ptype not in ("NEW_WORK", "REDEC"):
+                            # Ask again; keep item pending.
+                            update_status(item=item, status="PENDING_CONFIRMATION", extra={"needs_project_type": True})
+                            reply_text = (
+                                "CONFIRMATION NEEDED\n"
+                                f"Quarantine ID: {item.qid}\n\n"
+                                "Please confirm whether this project is NEW WORK or REDEC.\n\n"
+                                "Reply with one of:\n"
+                                f"- CONFIRM {item.qid} | SITE={site} | REPORT={rep} | TYPE=NEW_WORK\n"
+                                f"- CONFIRM {item.qid} | SITE={site} | REPORT={rep} | TYPE=REDEC\n"
+                            )
+
+                            # Send reply and mark read
+                            try:
+                                draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                                draft_id = draft["id"]
+                                graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload={"body": {"contentType": "Text", "content": reply_text}})
+                                graph.send_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id)
+                            except Exception:
+                                pass
+                            graph.mark_read(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                            continue
+
+                        # Ensure site exists (first-time site onboarding confirmation flow)
+                        try:
+                            site_svc.get_site_or_raise(site)
+                        except Exception:
+                            # Create site using extracted PDF identity if available
+                            pdf_name = str(item.meta.get("pdf_site_name_display") or item.meta.get("pdf_site_name_raw") or site).strip()
+                            created = site_svc.create_site(site_code=site, site_name=pdf_name)
+                            # Persist additional metadata if provided
+                            try:
+                                conn.execute(
+                                    """
+                                    UPDATE sites
+                                    SET site_name_raw = COALESCE(site_name_raw, ?),
+                                        address = COALESCE(address, ?),
+                                        supplier_client = COALESCE(supplier_client, ?),
+                                        contractor_on_site = COALESCE(contractor_on_site, ?),
+                                        project_type = COALESCE(project_type, ?)
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        (item.meta.get("pdf_site_name_raw") if isinstance(item.meta, dict) else None),
+                                        (item.meta.get("pdf_address") if isinstance(item.meta, dict) else None),
+                                        (item.meta.get("pdf_supplier_client") if isinstance(item.meta, dict) else None),
+                                        (item.meta.get("pdf_contractor_on_site") if isinstance(item.meta, dict) else None),
+                                        (ptype if require_ptype else None),
+                                        int(created.id),
+                                    ),
+                                )
+                            except Exception:
+                                pass
 
                         # Ingest as QA_REPORT
                         out = report_svc.ingest_report(site_code=site, report_code=rep, file_path=item.file_path)
@@ -349,6 +611,13 @@ class EmailWatcher:
                                 "site": site,
                                 "report": rep,
                                 "ingest": out,
+                                "site_identity": {
+                                    "site_name_raw": item.meta.get("pdf_site_name_raw") if isinstance(item.meta, dict) else None,
+                                    "site_name_display": item.meta.get("pdf_site_name_display") if isinstance(item.meta, dict) else None,
+                                    "address": item.meta.get("pdf_address") if isinstance(item.meta, dict) else None,
+                                    "supplier_client": item.meta.get("pdf_supplier_client") if isinstance(item.meta, dict) else None,
+                                    "contractor_on_site": item.meta.get("pdf_contractor_on_site") if isinstance(item.meta, dict) else None,
+                                },
                             },
                         )
 
@@ -392,6 +661,22 @@ class EmailWatcher:
                         continue
 
                 cmd = parse_subject(subject)
+
+                # Conversational email mode: site code in subject, natural language in body.
+                # If the deterministic parser didn't produce a site_code, infer it from the subject.
+                inferred_site = None
+                try:
+                    if not cmd.site_code:
+                        inferred_site = _infer_site_code_from_subject(subject=subject, site_repo=site_repo)
+                except Exception:
+                    inferred_site = None
+
+                if cmd.kind == "UNKNOWN" and inferred_site:
+                    # Treat as ASSIST for that site; body will be used as the request later.
+                    from peter.interfaces.email.classifier import ParsedCommand
+
+                    cmd = ParsedCommand("ASSIST", inferred_site, None)
+
                 stats["commands"][cmd.kind] = int(stats["commands"].get(cmd.kind, 0)) + 1
 
                 # If subject is not recognized, attempt attachment-driven inference
@@ -442,6 +727,13 @@ class EmailWatcher:
                     # store under site email archive if we can resolve site, else global data dir
                     if cmd.site_code and site_id:
                         site = site_repo.get_by_code(cmd.site_code)
+                        if not site:
+                            auto = os.getenv("PETER_AUTO_CREATE_SITES", "").strip().lower() in ("1", "true", "yes")
+                            if auto:
+                                site_svc.create_site(site_code=cmd.site_code, site_name=cmd.site_code)
+                                site = site_repo.get_by_code(cmd.site_code)
+                        if not site:
+                            raise RuntimeError(f"Unknown site_code: {cmd.site_code}")
                         sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
                         eml_name = f"{site.site_code}__EMAIL__{cmd.kind}__{mid}.eml"
                         eml_path = sandbox.build_path("04_email_archive", eml_name)
@@ -482,11 +774,23 @@ class EmailWatcher:
                         if not cmd.site_code:
                             raise RuntimeError("Missing site_code")
 
-                        # Resolve site sandbox for quarantine/archival
+                        # Resolve site sandbox for quarantine/archival.
+                        # Technician-friendly onboarding: for first-time sites, require confirmation
+                        # before committing a new site to memory.
                         site = site_repo.get_by_code(cmd.site_code)
-                        if not site:
-                            raise RuntimeError(f"Unknown site_code: {cmd.site_code}")
-                        sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                        require_first = os.getenv("PETER_EMAIL_REQUIRE_SITE_CONFIRM_FIRST_TIME", "1").strip().lower() in ("1", "true", "yes")
+                        if not site and cmd.kind == "QA_REPORT" and require_first:
+                            site = None
+                        elif not site:
+                            auto = os.getenv("PETER_AUTO_CREATE_SITES", "").strip().lower() in ("1", "true", "yes")
+                            if auto:
+                                # Placeholder name; you can formalize later.
+                                site_svc.create_site(site_code=cmd.site_code, site_name=cmd.site_code)
+                                site = site_repo.get_by_code(cmd.site_code)
+                            if not site:
+                                raise RuntimeError(f"Unknown site_code: {cmd.site_code}")
+
+                        sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name) if site else None
 
                         attachments = graph.list_attachments(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
 
@@ -560,26 +864,124 @@ class EmailWatcher:
                             except Exception:
                                 pdfs = []
 
-                        # Quarantine non-PDF attachments always
-                        for o in others:
-                            try:
-                                qname = f"{site.site_code}__EMAIL__{cmd.kind}__{mid}__{o['sha'][:12]}__{o['name']}".replace("/", "_")
-                                qpath = sandbox.build_path("99_quarantine", qname)
-                                qpath.write_bytes(o["data"])
-                                sandbox.build_path("99_quarantine", qname + ".reason.txt").write_text(
-                                    "Non-PDF email attachment quarantined.\n", encoding="utf-8"
+                        # If this is the first time we've seen the site, require confirmation
+                        # before committing the site + ingesting.
+                        if site is None and cmd.kind == "QA_REPORT" and require_first:
+                            if len(pdfs) != 1:
+                                reply_text = (
+                                    f"NEW SITE (confirmation required)\n\n"
+                                    f"I received a QA report for site code '{cmd.site_code}', but this site is not in my database yet.\n"
+                                    f"Please resend with exactly 1 PDF (or 1 ZIP containing 1 PDF).\n"
+                                    f"PDFs detected: {len(pdfs)}\n"
+                                )
+                            else:
+                                p = pdfs[0]
+                                # Extract identity from PDF
+                                rid = None
+                                try:
+                                    rid = infer_from_pdf_bytes(p["data"])
+                                except Exception:
+                                    rid = None
+
+                                claimed_site = (cmd.site_code or "").strip().upper()
+                                claimed_rep = (cmd.arg or "").strip().upper().replace(" ", "")
+                                if claimed_rep.startswith("R") and claimed_rep[1:].isdigit():
+                                    claimed_rep = claimed_rep[1:]
+                                if claimed_rep.isdigit():
+                                    claimed_rep = claimed_rep.zfill(3)
+
+                                detected_site = (rid.site_code if rid else claimed_site)
+                                detected_rep = (rid.report_no if rid else claimed_rep)
+
+                                item = save_quarantine_item(
+                                    data_dir=Path(self.settings.DATA_DIR),
+                                    filename=p["name"],
+                                    content=p["data"],
+                                    meta={
+                                        "original_from": from_addr,
+                                        "graph_message_id": mid,
+                                        "subject": subject,
+                                        "claimed_site": claimed_site,
+                                        "claimed_report": claimed_rep,
+                                        "detected_site": detected_site,
+                                        "detected_report": detected_rep,
+                                        "pdf_site_name_raw": (rid.site_name_raw if rid else None),
+                                        "pdf_site_name_display": (rid.site_name_display if rid else None),
+                                        "pdf_address": (rid.address if rid else None),
+                                        "pdf_supplier_client": (rid.supplier_client if rid else None),
+                                        "pdf_contractor_on_site": (rid.contractor_on_site if rid else None),
+                                        "require_project_type": True,
+                                        "note": "First-time site: confirm site identity before commit",
+                                    },
                                 )
 
-                                email_att_repo.insert(
-                                    email_event_id=event_id,
-                                    filename=o["name"],
-                                    content_type=o["content_type"],
-                                    sha256=o["sha"],
-                                    stored_path=str(qpath.relative_to(self.settings.QA_ROOT)),
-                                    quarantined=True,
-                                )
-                            except Exception:
-                                pass
+                                # Audit attachment record
+                                try:
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=p["name"],
+                                        content_type=p["content_type"],
+                                        sha256=p["sha"],
+                                        stored_path=str(item.file_path),
+                                        quarantined=True,
+                                    )
+                                except Exception:
+                                    pass
+
+                                # Compose confirmation request
+                                lines = [
+                                    "NEW SITE (confirmation required)",
+                                    f"Quarantine ID: {item.qid}",
+                                    "",
+                                    f"Proposed site reference: {detected_site}",
+                                ]
+                                if rid and rid.site_name_display:
+                                    lines.append(f"Site name: {rid.site_name_display}")
+                                if rid and rid.address:
+                                    lines.append(f"Address: {rid.address}")
+                                if rid and rid.supplier_client:
+                                    lines.append(f"Supplier / Client: {rid.supplier_client}")
+                                if rid and rid.contractor_on_site:
+                                    lines.append(f"Contractor on site: {rid.contractor_on_site}")
+                                if detected_rep:
+                                    lines.append(f"Report number: {detected_rep}")
+
+                                lines += [
+                                    "",
+                                    "Project type (required):",
+                                    "- NEW_WORK  (new build / new work)",
+                                    "- REDEC     (redecoration / repaint)",
+                                    "",
+                                    "Reply with:",
+                                    f"- CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=NEW_WORK",
+                                    f"- CONFIRM {item.qid} | SITE={detected_site} | REPORT={detected_rep} | TYPE=REDEC",
+                                    f"- REJECT {item.qid}",
+                                    "",
+                                    "(You can also reply in plain text like: 'Confirm Q-... redecorations')",
+                                ]
+                                reply_text = "\n".join(lines) + "\n"
+
+                        else:
+                            # Quarantine non-PDF attachments always
+                            for o in others:
+                                try:
+                                    qname = f"{site.site_code}__EMAIL__{cmd.kind}__{mid}__{o['sha'][:12]}__{o['name']}".replace("/", "_")
+                                    qpath = sandbox.build_path("99_quarantine", qname)
+                                    qpath.write_bytes(o["data"])
+                                    sandbox.build_path("99_quarantine", qname + ".reason.txt").write_text(
+                                        "Non-PDF email attachment quarantined.\n", encoding="utf-8"
+                                    )
+
+                                    email_att_repo.insert(
+                                        email_event_id=event_id,
+                                        filename=o["name"],
+                                        content_type=o["content_type"],
+                                        sha256=o["sha"],
+                                        stored_path=str(qpath.relative_to(self.settings.QA_ROOT)),
+                                        quarantined=True,
+                                    )
+                                except Exception:
+                                    pass
 
                         # If still no PDFs, attempt link-based fetch from the email body.
                         if not pdfs:
@@ -660,7 +1062,16 @@ class EmailWatcher:
                             except Exception:
                                 detected = None
 
-                            claimed_site = (cmd.site_code or "").strip().upper()
+                            claimed_site_raw = (cmd.site_code or "").strip().upper()
+
+                            # Technician-friendly: normalize site codes that include spaces/punctuation.
+                            # Default behavior: require confirmation if normalization changes the code.
+                            def _normalize_site_code(x: str) -> str:
+                                return re.sub(r"[^A-Z0-9]+", "", (x or "").upper())
+
+                            claimed_site = claimed_site_raw
+                            norm_site = _normalize_site_code(claimed_site_raw)
+
                             claimed_rep = (cmd.arg or "").strip().upper().replace(" ", "")
                             # normalize claimed report to 3-digit numeric if possible
                             if claimed_rep.startswith("R") and claimed_rep[1:].isdigit():
@@ -668,7 +1079,47 @@ class EmailWatcher:
                             if claimed_rep.isdigit():
                                 claimed_rep = claimed_rep.zfill(3)
 
-                            if detected and claimed_site and claimed_rep and (detected.site_code != claimed_site or detected.report_no != claimed_rep):
+                            normalize_mode = os.getenv("PETER_EMAIL_SITE_CODE_NORMALIZE", "confirm").strip().lower()
+                            if norm_site and norm_site != claimed_site_raw and normalize_mode in ("1", "true", "yes", "confirm"):
+                                # Quarantine and ask for confirmation of normalized site code.
+                                item = save_quarantine_item(
+                                    data_dir=Path(self.settings.DATA_DIR),
+                                    filename=p["name"],
+                                    content=p["data"],
+                                    meta={
+                                        "original_from": from_addr,
+                                        "graph_message_id": mid,
+                                        "subject": subject,
+                                        "claimed_site": claimed_site_raw,
+                                        "claimed_report": claimed_rep,
+                                        "detected_site": norm_site,
+                                        "detected_report": claimed_rep,
+                                        "note": "Site code normalized from subject",
+                                    },
+                                )
+                                reply_text = (
+                                    f"QUARANTINED (site code needs confirmation)\n"
+                                    f"Quarantine ID: {item.qid}\n\n"
+                                    f"Provided site code: {claimed_site_raw}\n"
+                                    f"Normalized site code: {norm_site}\n\n"
+                                    f"Reply with one of:\n"
+                                    f"- CONFIRM {item.qid} | SITE={norm_site} | REPORT={claimed_rep}\n"
+                                    f"- REJECT {item.qid}\n\n"
+                                    f"File saved: {str(item.file_path)}\n"
+                                )
+                                # Skip further processing for this message; reply will be sent below.
+                                # Mark as quarantined attachment for audit
+                                detected = None
+                                out_path = None
+                                # Jump to reply send by setting should_send and leaving other branches.
+                                # We do this by using a sentinel prefix and later skip ingest when reply_text starts with QUARANTINED.
+                                
+                            claimed_site = norm_site or claimed_site_raw
+
+                            if reply_text.startswith("QUARANTINED (site code needs confirmation)"):
+                                # site-code normalization quarantine already prepared above
+                                pass
+                            elif detected and claimed_site and claimed_rep and (detected.site_code != claimed_site or detected.report_no != claimed_rep):
                                 # Quarantine and ask for confirmation
                                 item = save_quarantine_item(
                                     data_dir=Path(self.settings.DATA_DIR),
@@ -781,12 +1232,12 @@ class EmailWatcher:
                                         n = len(out_v.get("omission_issues_created") or [])
                                         vision_json = out_v.get("vision_json")
                                         vision_note = (
-                                            "\n\nVISION CHECK (auto)\n"
-                                            f"- visual omissions flagged: {n}\n"
+                                            "\n\nVISUAL ANALYSIS (auto)\n"
+                                            f"- omissions flagged: {n}\n"
                                             f"- artifact: {vision_json}\n"
                                         )
 
-                                        # Add short, human-readable vision findings (blocking + notable)
+                                        # Add short, human-readable vision findings (critical + notable)
                                         try:
                                             from peter.interfaces.email.vision_summary import summarize_vision_json
 
@@ -799,9 +1250,9 @@ class EmailWatcher:
                                             )
 
                                             if vs.blocking:
-                                                vision_note += "\nVISION — Blocking photo findings\n" + "\n".join(vs.blocking[:10]) + "\n"
+                                                vision_note += "\nVISUAL ANALYSIS — Critical photo findings (Immediate action required)\n" + "\n".join(vs.blocking[:10]) + "\n"
                                             if vs.notable:
-                                                vision_note += "\nVISION — Notable observations (non-blocking)\n" + "\n".join(vs.notable) + "\n"
+                                                vision_note += "\nVISUAL ANALYSIS — Notable observations (non-critical)\n" + "\n".join(vs.notable) + "\n"
                                         except Exception:
                                             pass
                                     except Exception as e:
@@ -832,7 +1283,7 @@ class EmailWatcher:
                                                 site_code=cmd.site_code,
                                                 report_code=rc,
                                                 question=(
-                                                    "Summarize the QA status for this report and list required next actions to address blocking issues. "
+                                                    "Summarize the QA status for this report and list required next actions. "
                                                     "Be concise and use bullets where helpful."
                                                 ),
                                                 mode="recommend",
@@ -840,8 +1291,47 @@ class EmailWatcher:
                                             + vision_note
                                             + "\n"
                                         )
-                                except Exception:
-                                    reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}" + vision_note
+                                except Exception as e:
+                                    # If OpenAI is down/quota exceeded, queue this report for reprocessing.
+                                    if _is_openai_outage(e):
+                                        # Queue metadata only (do NOT duplicate the PDF bytes).
+                                        report_id = None
+                                        stored_path = None
+                                        try:
+                                            if isinstance(out, dict):
+                                                report_id = out.get("report_id")
+                                                stored_path = out.get("stored_path")
+                                        except Exception:
+                                            pass
+
+                                        item = save_quarantine_item(
+                                            data_dir=Path(self.settings.DATA_DIR),
+                                            filename=str(p.get("name") or "report.pdf"),
+                                            content=b"",
+                                            meta={
+                                                "status": "PENDING_API",
+                                                "kind": "PENDING_API_QA_REPORT",
+                                                "graph_message_id": mid,
+                                                "site_code": cmd.site_code,
+                                                "report_code": rc,
+                                                "report_id": report_id,
+                                                "stored_path": stored_path,
+                                                "retry_count": 0,
+                                                "last_retry_at": None,
+                                                "note": "Queued due to OpenAI outage/quota; will reprocess automatically",
+                                            },
+                                        )
+
+                                        reply_text = (
+                                            "RECEIVED (queued)\n"
+                                            f"- site: {cmd.site_code}\n"
+                                            f"- report: {rc}\n"
+                                            "- status: OpenAI temporarily unavailable (quota/rate limit).\n"
+                                            "- action: queued for automatic reprocessing.\n"
+                                            f"- reference: {item.qid}\n"
+                                        )
+                                    else:
+                                        reply_text = f"OK report ingested site={cmd.site_code} report={rc} status={out['status']} report_id={out['report_id']}" + vision_note
 
                     elif cmd.kind == "QUERY":
                         if not cmd.site_code or not cmd.arg:
@@ -937,10 +1427,39 @@ class EmailWatcher:
 
                         reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
                     else:
-                        # If subject is not recognized, do NOT send any email.
-                        # We will attempt attachment-driven inference for a single PDF.
-                        should_send = False
-                        reply_text = "IGNORED: Unrecognized subject format (no reply sent)."
+                        # If subject is not recognized:
+                        # - If there is a known site code in the subject, treat as ASSIST (conversational).
+                        # - Otherwise, send a friendly instruction (internal-only) on how to format subjects.
+                        if cmd.kind == "ASSIST" and cmd.site_code:
+                            # Prefer message body as the request.
+                            from peter.interfaces.email.assist import run_assist
+
+                            req = (cmd.arg or "").strip()
+                            try:
+                                full = graph.get_message(mailbox=self.settings.BOT_MAILBOX, message_id=mid, select="body")
+                                body = (full.get("body") or {}).get("content") or ""
+                                if str(body).strip():
+                                    req = str(body).strip()
+                            except Exception:
+                                pass
+
+                            if not req:
+                                raise RuntimeError("ASSIST missing request (empty email body)")
+
+                            reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
+                        else:
+                            # Still mark read to avoid loops, but if internal-only we can reply with guidance.
+                            # Keep it simple and actionable.
+                            reply_text = (
+                                "I couldn't identify which site/project this email refers to.\n\n"
+                                "Please include the SITE CODE in the email subject (e.g. '... <SITECODE> ...').\n"
+                                "Then write your question normally in the email body (e.g. 'latest QA update? top issues?').\n\n"
+                                "Example subject formats:\n"
+                                "- QA update <SITECODE>\n"
+                                "- Re: <SITECODE> QA reports\n"
+                            )
+                            # We *do* send this guidance reply (internal-only recipients will be enforced later).
+                            should_send = True
                 except Exception as e:
                     from peter.interfaces.email.error_format import make_error_id, format_error_email, format_trace_for_logs
 
@@ -949,7 +1468,23 @@ class EmailWatcher:
                     import logging
 
                     logging.getLogger("peter.email").error(format_trace_for_logs(error_id=error_id, exc=e))
-                    reply_text = format_error_email(cmd=str(cmd), stage="handler", error_id=error_id, exc=e)
+
+                    # Friendly technician-facing error (LLM), fallback to structured error.
+                    body_excerpt = ""
+                    try:
+                        full = graph.get_message(mailbox=self.settings.BOT_MAILBOX, message_id=mid, select="body")
+                        body_excerpt = str(((full.get("body") or {}).get("content") or "")).strip()
+                    except Exception:
+                        body_excerpt = ""
+
+                    friendly = _friendly_error_via_llm(
+                        settings=self.settings,
+                        subject=subject,
+                        body=body_excerpt,
+                        error_id=error_id,
+                        exc=e,
+                    )
+                    reply_text = friendly or format_error_email(cmd=str(cmd), stage="handler", error_id=error_id, exc=e)
 
                 if not should_send:
                     # Still mark read to avoid loops.

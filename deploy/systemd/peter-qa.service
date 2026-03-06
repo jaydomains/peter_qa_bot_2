@@ -1,0 +1,31 @@
+[Unit]
+Description=PETER QA Bot (Decorative Architectural Coatings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/.openclaw/workspace/peter_qa_bot_2
+
+# Load secrets/config (OPENAI_API_KEY, etc.)
+EnvironmentFile=/root/.openclaw/workspace/peter_qa_bot_2/.env
+
+# Run the long-lived daemon loop
+ExecStart=/usr/bin/env PYTHONPATH=src /usr/bin/python3 -m peter daemon
+
+Restart=on-failure
+RestartSec=5
+
+# Journald logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=peter-qa
+
+# Basic hardening (keep modest; this bot needs filesystem access under its data dir)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

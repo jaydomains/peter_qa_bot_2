@@ -13,6 +13,14 @@ class ReportIdentity:
     site_code: str
     report_no: str  # 3-digit
 
+    # Stable header identity (text-extractable in Fieldwire reports)
+    site_name_raw: str | None = None
+    site_name_display: str | None = None
+    address: str | None = None
+
+    supplier_client: str | None = None
+    contractor_on_site: str | None = None
+
     @property
     def display_ref(self) -> str:
         return f"{self.site_code} - {self.report_no}"
@@ -24,10 +32,16 @@ def _z3(s: str) -> str:
 
 
 def infer_from_pdf_bytes(pdf_bytes: bytes) -> ReportIdentity | None:
-    """Infer site_code + report_no from report PDF.
+    """Infer site identity from report PDF.
 
-    Supports legacy format (Inspection Reference: PRSVNQA - 006) and
-    new format (Report #: 006 + Inspection Reference: PRSVNQA - 006).
+    Returns:
+      - site_code + report_no (3-digit)
+      - plus best-effort extraction of:
+        - site_name_raw / site_name_display (from first header line)
+        - address (from second header line)
+        - supplier_client, contractor_on_site (from labeled fields)
+
+    All text is assumed extractable (Fieldwire template).
     """
 
     with tempfile.TemporaryDirectory() as td:
@@ -72,4 +86,38 @@ def infer_from_pdf_bytes(pdf_bytes: bytes) -> ReportIdentity | None:
     if not (site_code and report_no):
         return None
 
-    return ReportIdentity(site_code=site_code, report_no=report_no)
+    # --- Extract stable header fields ---
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    header1 = lines[0] if lines else ""
+    header2 = lines[1] if len(lines) > 1 else ""
+
+    site_name_raw = header1 or None
+    address = header2 or None
+
+    # Header line format examples:
+    #   "PR - NEWINBOSCH ILEX —"
+    #   "PLA - De Drift Shopping Centre —"
+    site_name_display = None
+    m_name = re.search(r"\b[A-Z]{2,4}\s*-\s*(.+?)\s*[—-]\s*$", header1)
+    if m_name:
+        site_name_display = m_name.group(1).strip()
+
+    # Supplier/contractor (best-effort)
+    supplier = None
+    contractor = None
+    m_sup = re.search(r"(?im)^\s*Supplier\s*/\s*Client\s*:\s*(.+)$", norm)
+    if m_sup:
+        supplier = m_sup.group(1).strip()
+    m_con = re.search(r"(?im)^\s*Contractor\s+On\s+Site\s*:\s*(.+)$", norm)
+    if m_con:
+        contractor = m_con.group(1).strip()
+
+    return ReportIdentity(
+        site_code=site_code,
+        report_no=report_no,
+        site_name_raw=site_name_raw,
+        site_name_display=site_name_display,
+        address=address,
+        supplier_client=supplier,
+        contractor_on_site=contractor,
+    )
