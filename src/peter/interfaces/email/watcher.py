@@ -460,15 +460,24 @@ class EmailWatcher:
                 if conf.kind in ("CONFIRM", "REJECT") and conf.qid:
                     from_addr_cmd = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
                     try:
-                        item = load_quarantine_item(data_dir=Path(self.settings.DATA_DIR), qid=conf.qid)
+                        item = None
+                        try:
+                            item = load_quarantine_item(data_dir=Path(self.settings.DATA_DIR), qid=conf.qid)
+                        except FileNotFoundError:
+                            item = None
 
                         # Authorization: internal + original sender or forced-cc member
                         allowed = False
                         if from_addr_cmd and from_addr_cmd.endswith("@" + self.settings.INTERNAL_DOMAIN):
-                            orig = str(item.meta.get("original_from") or "").lower()
                             forced = [a.strip().lower() for a in (self.settings.REVIEW_DLIST or [])]
-                            if from_addr_cmd == orig or from_addr_cmd in forced:
-                                allowed = True
+                            if item is not None:
+                                orig = str(item.meta.get("original_from") or "").lower()
+                                if from_addr_cmd == orig or from_addr_cmd in forced:
+                                    allowed = True
+                            else:
+                                # issue_confirmation: allow the sender or forced cc
+                                if from_addr_cmd in forced or from_addr_cmd:
+                                    allowed = True
 
                         if not allowed:
                             # Mark read, ignore
@@ -476,11 +485,105 @@ class EmailWatcher:
                             continue
 
                         if conf.kind == "REJECT":
-                            update_status(item=item, status="REJECTED", extra={"rejected_by": from_addr_cmd})
+                            if item is not None:
+                                update_status(item=item, status="REJECTED", extra={"rejected_by": from_addr_cmd})
+                            else:
+                                try:
+                                    conn.execute(
+                                        "UPDATE issue_confirmations SET status='REJECTED', confirmed_by=?, confirmed_at=datetime('now'), response_text=? WHERE qid=?",
+                                        (from_addr_cmd, "REJECT", conf.qid),
+                                    )
+                                except Exception:
+                                    pass
                             graph.mark_read(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
                             continue
 
                         # CONFIRM
+                        if item is None:
+                            # This is an issue_confirmation task (spec deviation confirmation), not a quarantined file.
+                            decision = (conf.decision or "").strip().upper()
+                            if decision not in ("USED", "NOT_USED", "MORE_INFO"):
+                                # Ask again
+                                reply_text = (
+                                    "CONFIRMATION NEEDED\n"
+                                    f"Reference: {conf.qid}\n\n"
+                                    "Reply with one of:\n"
+                                    f"- CONFIRM {conf.qid} | DECISION=USED\n"
+                                    f"- CONFIRM {conf.qid} | DECISION=NOT_USED\n"
+                                    f"- CONFIRM {conf.qid} | DECISION=MORE_INFO\n"
+                                )
+                            else:
+                                status = {
+                                    "USED": "CONFIRMED_USED",
+                                    "NOT_USED": "CONFIRMED_NOT_USED",
+                                    "MORE_INFO": "NEEDS_MORE_INFO",
+                                }[decision]
+                                try:
+                                    conn.execute(
+                                        """
+                                        UPDATE issue_confirmations
+                                        SET status=?, response_text=?, confirmed_by=?, confirmed_at=datetime('now')
+                                        WHERE qid=?
+                                        """,
+                                        (status, decision, from_addr_cmd, conf.qid),
+                                    )
+                                    # Apply linkage to issues
+                                    rows = conn.execute(
+                                        """
+                                        SELECT i.id
+                                        FROM issues i
+                                        WHERE i.confirmation_qid = ?
+                                        """,
+                                        (conf.qid,),
+                                    ).fetchall()
+                                    for r0 in rows:
+                                        iid = int(r0["id"])
+                                        conn.execute(
+                                            """
+                                            UPDATE issues
+                                            SET confirmation_status = ?,
+                                                confirmation_decision = ?,
+                                                confirmation_confirmed_by = ?,
+                                                confirmation_confirmed_at = datetime('now')
+                                            WHERE id = ?
+                                            """,
+                                            (status, decision, from_addr_cmd, iid),
+                                        )
+                                        # If confirmed NOT_USED, de-risk the issue (keep record)
+                                        if decision == "NOT_USED":
+                                            conn.execute(
+                                                "UPDATE issues SET is_blocking = 0, severity = 'INFO' WHERE id = ?",
+                                                (iid,),
+                                            )
+                                    # Update item rows
+                                    conn.execute(
+                                        """
+                                        UPDATE issue_confirmation_items
+                                        SET decision=?, decided_at=datetime('now'), decided_by=?
+                                        WHERE confirmation_id = (SELECT id FROM issue_confirmations WHERE qid=?)
+                                        """,
+                                        (decision, from_addr_cmd, conf.qid),
+                                    )
+                                except Exception:
+                                    pass
+
+                                reply_text = (
+                                    "CONFIRMATION RECORDED\n"
+                                    f"Reference: {conf.qid}\n"
+                                    f"Decision: {decision}\n"
+                                )
+
+                            # send reply
+                            try:
+                                draft = graph.create_reply_draft(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                                draft_id = draft["id"]
+                                graph.update_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id, payload={"body": {"contentType": "Text", "content": reply_text}})
+                                graph.send_message(mailbox=self.settings.BOT_MAILBOX, message_id=draft_id)
+                            except Exception:
+                                pass
+                            graph.mark_read(mailbox=self.settings.BOT_MAILBOX, message_id=mid)
+                            continue
+
                         site = (conf.site or str(item.meta.get("detected_site") or "")).strip().upper()
                         rep = (conf.report or str(item.meta.get("detected_report") or "")).strip().upper()
                         rep = rep.replace("R", "") if rep.startswith("R") and rep[1:].isdigit() else rep
@@ -1323,14 +1426,56 @@ class EmailWatcher:
                                                 prompt = "\n".join(prompt_lines) + "\n"
 
                                                 # Persist to DB so replies can be processed later.
+                                                conf_id = None
                                                 try:
-                                                    conn.execute(
+                                                    cur = conn.execute(
                                                         """
                                                         INSERT INTO issue_confirmations(email_event_id, report_id, qid, status, prompt)
                                                         VALUES (?, ?, ?, 'PENDING', ?)
                                                         """,
                                                         (event_id, rid2, qid, prompt),
                                                     )
+                                                    conf_id = int(cur.lastrowid)
+
+                                                    # Link individual issues to this confirmation
+                                                    # (actual linkage is done in the block below where we re-fetch with ids)
+                                                    
+                                                except Exception:
+                                                    conf_id = None
+
+                                                # Store per-issue linkage (include issue ids)
+                                                try:
+                                                    if conf_id:
+                                                        dev_rows = conn.execute(
+                                                            """
+                                                            SELECT id, severity, category, description
+                                                            FROM issues
+                                                            WHERE report_id = ? AND issue_type = 'SPEC_DEVIATION'
+                                                            ORDER BY created_at DESC
+                                                            LIMIT 20
+                                                            """,
+                                                            (rid2,),
+                                                        ).fetchall()
+                                                        for ir in dev_rows[:10]:
+                                                            iid = int(ir["id"])
+                                                            sev = str(ir["severity"])
+                                                            cat = str(ir["category"])
+                                                            desc = str(ir["description"] or "")
+                                                            conn.execute(
+                                                                """
+                                                                INSERT INTO issue_confirmation_items(confirmation_id, issue_id, issue_category, issue_severity, issue_excerpt)
+                                                                VALUES (?, ?, ?, ?, ?)
+                                                                """,
+                                                                (conf_id, iid, cat, sev, desc[:260]),
+                                                            )
+                                                            conn.execute(
+                                                                """
+                                                                UPDATE issues
+                                                                SET confirmation_qid = ?, confirmation_status = 'PENDING'
+                                                                WHERE id = ?
+                                                                """,
+                                                                (qid, iid),
+                                                            )
                                                 except Exception:
                                                     pass
 

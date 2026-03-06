@@ -46,6 +46,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     if version < 6:
         _migrate_v5_to_v6(conn)
         conn.execute("UPDATE schema_version SET version = 6, applied_at = datetime('now') WHERE id = 1")
+        version = 6
+
+    # v7: issue_confirmation_items + add confirmation fields to issues
+    if version < 7:
+        _migrate_v6_to_v7(conn)
+        conn.execute("UPDATE schema_version SET version = 7, applied_at = datetime('now') WHERE id = 1")
 
 
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -54,6 +60,41 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     from peter.db.migrations_v4 import migrate
 
     migrate(conn)
+
+
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    # Add columns to issues for linkage + disposition
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}
+    if "confirmation_qid" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN confirmation_qid TEXT")
+    if "confirmation_status" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN confirmation_status TEXT")
+    if "confirmation_decision" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN confirmation_decision TEXT")
+    if "confirmation_confirmed_by" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN confirmation_confirmed_by TEXT")
+    if "confirmation_confirmed_at" not in cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN confirmation_confirmed_at TEXT")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS issue_confirmation_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          confirmation_id INTEGER NOT NULL,
+          issue_id INTEGER,
+          issue_category TEXT,
+          issue_severity TEXT,
+          issue_excerpt TEXT,
+          decision TEXT CHECK (decision IN ('USED','NOT_USED','MORE_INFO')),
+          decided_at TEXT,
+          decided_by TEXT,
+          CONSTRAINT fk_ici_conf FOREIGN KEY (confirmation_id) REFERENCES issue_confirmations(id) ON DELETE CASCADE,
+          CONSTRAINT fk_ici_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ici_conf_id ON issue_confirmation_items(confirmation_id);
+        CREATE INDEX IF NOT EXISTS idx_ici_issue_id ON issue_confirmation_items(issue_id);
+        """
+    )
 
 
 def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:

@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 6);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 7);
 
 CREATE TABLE IF NOT EXISTS sites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS issue_confirmations (
 );
 CREATE INDEX IF NOT EXISTS idx_ic_report_id ON issue_confirmations(report_id);
 CREATE INDEX IF NOT EXISTS idx_ic_email_event_id ON issue_confirmations(email_event_id);
+
+CREATE TABLE IF NOT EXISTS issue_confirmation_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  confirmation_id INTEGER NOT NULL,
+  issue_id INTEGER,
+  issue_category TEXT,
+  issue_severity TEXT,
+  issue_excerpt TEXT,
+  decision TEXT CHECK (decision IN ('USED','NOT_USED','MORE_INFO')),
+  decided_at TEXT,
+  decided_by TEXT,
+  CONSTRAINT fk_ici_conf FOREIGN KEY (confirmation_id) REFERENCES issue_confirmations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_ici_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ici_conf_id ON issue_confirmation_items(confirmation_id);
+CREATE INDEX IF NOT EXISTS idx_ici_issue_id ON issue_confirmation_items(issue_id);
 
 CREATE TABLE IF NOT EXISTS feedback_signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
