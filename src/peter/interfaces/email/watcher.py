@@ -2155,6 +2155,8 @@ class EmailWatcher:
                                 if not products_path.exists():
                                     raise RuntimeError(f"Products allowlist not found: {products_name}")
 
+                                import json
+
                                 pdata = json.loads(products_path.read_text(encoding="utf-8"))
                                 pps = list(pdata.get("paint_products") or [])
 

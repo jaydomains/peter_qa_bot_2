@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/.openclaw/workspace/peter_qa_bot_2
+WorkingDirectory=/root/.openclaw/workspace/peter_qa_bot_live_version
 
 # Load secrets/config (OPENAI_API_KEY, etc.)
-EnvironmentFile=/root/.openclaw/workspace/peter_qa_bot_2/.env
+EnvironmentFile=/root/.openclaw/workspace/peter_qa_bot_live_version/.env
 
 # Run the long-lived daemon loop
 ExecStart=/usr/bin/env PYTHONPATH=src /usr/bin/python3 -m peter daemon
