@@ -934,19 +934,65 @@ class ReportService:
                         for op in pr.get("observed_products") or []:
                             observed.append((int(pr.get("page") or pr.get("page_number") or 0), op))
 
+                    def _norm(s: str) -> str:
+                        return re.sub(r"\s+", " ", (s or "").strip())
+
+                    def _is_moisture_or_tape_note(text: str) -> bool:
+                        t = _norm(text).upper()
+                        if not t:
+                            return True
+                        # Common patterns: moisture % + date on tape (e.g. "7.9% EMT 15/10/25")
+                        if re.search(r"\b\d+(?:\.\d+)?%\b", t) and re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", t):
+                            return True
+                        if re.fullmatch(r"\d+(?:\.\d+)?%.*", t):
+                            return True
+                        # Common note tokens
+                        if any(x in t for x in ["EMT", "MT", "DATE", "READING", "MOISTURE"]):
+                            # only treat as note when it doesn't look like a product code mention
+                            if not re.search(r"\b[A-Z]{2,6}\s*\d{2,4}\b|\b[A-Z]{2,6}\s*\d{2,4}/[A-Z]{2,6}\b|\b[A-Z]{2,6}/[A-Z]{2,6}\b", t):
+                                return True
+                        return False
+
+                    def _looks_like_product_evidence(*, raw_text: str, code: str | None) -> bool:
+                        rt = _norm(raw_text)
+                        cu = _norm(str(code or "")).upper()
+                        # Strong signal: explicit code with letters (PP200, VEL/TDV, PEM1000/TLS, etc.)
+                        if cu and re.search(r"[A-Z]", cu):
+                            return True
+                        # If raw text contains a parenthesized code-like token
+                        if re.search(r"\([A-Z]{2,8}[A-Z0-9/ -]{0,20}\)", rt, flags=re.I):
+                            return True
+                        # Product-ish keywords
+                        if re.search(r"\b(PRIMER|TOPCOAT|UNDERCOAT|COATING|VELVET|PLASCON|PROFESSIONAL)\b", rt, flags=re.I):
+                            return True
+                        return False
+
                     for page_num, op in observed:
                         raw = str(op.get("raw_text") or "")
                         code = op.get("product_code")
+
+                        # Do not treat moisture tape / handwritten notes as products.
+                        if not _looks_like_product_evidence(raw_text=raw, code=code) or _is_moisture_or_tape_note(raw):
+                            continue
+
                         if match_observed(allow=allow, raw_text=raw, code=code):
                             continue
 
                         conf = float(op.get("confidence") or 0.0)
                         brand = str(op.get("brand") or "")
+                        notes = str(op.get("notes") or "")
+
+                        # Attempt to describe evidence source more accurately than LABEL_ONLY.
+                        src = "REPORT_TABLE_TEXT" if re.search(r"\b(table|listed|coating system)\b", notes, flags=re.I) else "PHOTO_LABEL_OCR"
+
                         desc = (
-                            f"Spec deviation (LABEL_ONLY): observed paint product not found in active spec allowlist. "
+                            f"Spec deviation ({src}): observed paint product not found in active spec allowlist. "
                             f"Observed='{raw}' code='{code or ''}' brand='{brand}'. Page {page_num}. "
                             f"Spec={vlabel}. Confidence={conf:.2f}."
                         )
+                        if notes:
+                            desc += f" Notes: {notes[:240]}"
+
                         self.issue_repo.insert(
                             report_id=report_id,
                             issue_type="SPEC_DEVIATION",

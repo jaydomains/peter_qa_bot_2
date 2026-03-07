@@ -204,8 +204,10 @@ def draft_email_reply_llm(
         "OUTPUT REQUIREMENTS:\n"
         "- Start with: PROJECT: <reference> — <name if available>\n"
         "- Then: OVERALL STATUS: PASS/WARN/FAIL (choose based on evidence; if result in metadata is set, respect it)\n"
+        "- Then add a dedicated section: SPEC / COMPLIANCE (bullets).\n"
+        "  - Put SPEC_DEVIATION items here first.\n"
         "- Then: Critical findings (Immediate action required) (bullets).\n"
-        "  - You MUST explicitly address EVERY item in BLOCKING_ISSUES, but refer to them as 'Critical findings'.\n"
+        "  - You MUST explicitly address EVERY item in BLOCKING_ISSUES.\n"
         "- Then: Other findings (non-critical) (bullets).\n"
         "- Then: Required actions (bullets).\n"
         "  - Each critical finding must have at least one required action tied to it.\n"
@@ -214,6 +216,9 @@ def draft_email_reply_llm(
         "  - If VISION evidence is '(not available)', say it was not available.\n"
         "- Add a section at the end: REPORT SUMMARY (short paragraph in plain English).\n"
         "- If DEPTH is deep: include a short 'What to verify next visit' section.\n"
+        "- IMPORTANT: Every bullet in SPEC/COMPLIANCE, Critical findings, and Other findings must end with a reference in this format:\n"
+        "  (Ref: Page <n> | Source: REPORT_TEXT/REPORT_TABLE/PHOTO_LABEL_OCR/PHOTO_NOTE_OCR/PHOTO_DEFECT)\n"
+        "  - If you cannot identify a page, say (Ref: Page ? | Source: ...) and explain uncertainty briefly.\n"
         "- End with: EVIDENCE (short list of what you used; include report code(s)).\n"
     )
 
