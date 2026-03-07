@@ -1685,6 +1685,26 @@ class EmailWatcher:
                                         )
                                         # SPEC_UPDATE ends here (no report triage/vision).
                                         reply_text = f"OK spec ingested site={cmd.site_code} spec_id={spec.id} version={spec.version_label}"
+
+                                        # In-thread whitelist confirmation: include extracted products for technician sign-off.
+                                        try:
+                                            # SpecService writes this draft to 00_admin/{SITE}__WHITELIST_CONFIRMATION__{REV}__{sha12}.txt
+                                            vlabel2 = str(spec.version_label)
+                                            ssha2 = str(spec.sha256)
+                                            fname = f"{cmd.site_code}__WHITELIST_CONFIRMATION__{vlabel2}__{ssha2[:12]}.txt"
+                                            confirm_path = sandbox.build_path("00_admin", fname)
+                                            if confirm_path.exists():
+                                                confirm_txt = confirm_path.read_text(encoding="utf-8")
+                                                # Append (keep the reply short at the top; details below)
+                                                reply_text = (
+                                                    reply_text
+                                                    + "\n\n"
+                                                    + "WHITELIST CONFIRMATION (please review)\n"
+                                                    + "Reply with: CONFIRM, or list changes (REMOVE / ADD / ADD ALIAS).\n\n"
+                                                    + confirm_txt.strip()
+                                                )
+                                        except Exception:
+                                            pass
                                     else:
                                         rc = (cmd.arg or "R01").strip().upper().replace(" ", "")
                                         out = report_svc.ingest_report(site_code=cmd.site_code, report_code=rc, file_path=out_path)
@@ -2082,7 +2102,6 @@ class EmailWatcher:
                     elif cmd.kind == "ASSIST":
                         if not cmd.site_code:
                             raise RuntimeError("ASSIST missing site")
-                        from peter.interfaces.email.assist import run_assist
 
                         # Prefer message body as the freeform request; fall back to subject arg.
                         req = (cmd.arg or "").strip()
@@ -2098,7 +2117,192 @@ class EmailWatcher:
                         if not req:
                             raise RuntimeError("ASSIST missing request (empty body and no subject arg)")
 
-                        reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
+                        # Natural-language whitelist edits (Phase 2):
+                        # Allow technicians to reply conversationally: "please add Double Velvet (VEL/TDV) to the whitelist".
+                        # This updates the active PRODUCTS allowlist immediately (site + active spec).
+                        try:
+                            import re as _re
+                            from pathlib import Path as _Path
+
+                            req_u = req.upper()
+                            wants_whitelist = any(k in req_u for k in ["WHITELIST", "ALLOWLIST", "ALLOWED PRODUCTS", "ADD PRODUCT", "REMOVE PRODUCT", "ADD ALIAS", "ALIAS"]) \
+                                and any(k in req_u for k in ["ADD", "REMOVE", "ALIAS", "WHITELIST", "ALLOWLIST"])
+
+                            if wants_whitelist:
+                                site = site_repo.get_by_code(cmd.site_code)
+                                if not site:
+                                    raise RuntimeError(f"Unknown site_code: {cmd.site_code}")
+
+                                sp = conn.execute(
+                                    """
+                                    SELECT sp.version_label, sp.sha256
+                                    FROM sites s
+                                    JOIN specs sp ON sp.id = s.active_spec_id
+                                    WHERE s.id = ?
+                                    """,
+                                    (site.id,),
+                                ).fetchone()
+
+                                if not sp or not sp["sha256"]:
+                                    raise RuntimeError("No active spec found for this site; ingest spec first")
+
+                                vlabel = str(sp["version_label"])
+                                ssha = str(sp["sha256"])
+                                sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                                products_name = f"{site.site_code}__PRODUCTS__{vlabel}__{ssha[:12]}.json"
+                                products_path = sandbox.build_path("00_admin", products_name)
+
+                                if not products_path.exists():
+                                    raise RuntimeError(f"Products allowlist not found: {products_name}")
+
+                                pdata = json.loads(products_path.read_text(encoding="utf-8"))
+                                pps = list(pdata.get("paint_products") or [])
+
+                                # Extract ADD candidates like "Double Velvet (VEL/TDV)".
+                                add: list[tuple[str, str]] = []
+                                for m in _re.finditer(r"([A-Z0-9& /-]{3,80}?)\s*\(([A-Z]{1,8}[A-Z0-9/ -]{0,20})\)", req_u):
+                                    name = m.group(1).strip(" -")
+                                    code = m.group(2).strip().replace(" ", "")
+                                    # Filter out common non-product phrases
+                                    if name in {"ITEM", "PAGE", "REV", "SITE"}:
+                                        continue
+                                    # Avoid treating microns like (36/50) as codes
+                                    if _re.fullmatch(r"\d{2,4}/\d{2,4}", code):
+                                        continue
+                                    add.append((name.title(), code.upper()))
+
+                                # Infer remove codes like "remove PP200" or "remove (PP200)"
+                                remove_codes = set()
+                                for m in _re.finditer(r"\bREMOVE\b[^\n]{0,60}?\b([A-Z]{1,8}[A-Z0-9/ -]{0,20})\b", req_u):
+                                    remove_codes.add(m.group(1).strip().replace(" ", "").upper())
+
+                                # Extract explicit alias suggestions: "alias: X" or "also known as X"
+                                alias_terms: list[str] = []
+                                for m in _re.finditer(r"\bALIASES?\b\s*[:\-]\s*([^\n]+)", req, flags=_re.I):
+                                    alias_terms.extend([a.strip() for a in str(m.group(1)).split(",") if a.strip()])
+
+                                # Apply removals
+                                if remove_codes:
+                                    pps = [x for x in pps if (str(x.get("code") or "").strip().replace(" ", "").upper() not in remove_codes)]
+
+                                # Apply adds (idempotent)
+                                existing_codes = {str(x.get("code") or "").strip().replace(" ", "").upper() for x in pps if x.get("code")}
+                                added_codes: list[str] = []
+                                for name, code in add:
+                                    if code in existing_codes:
+                                        continue
+                                    pps.append(
+                                        {
+                                            "raw_mention": f"{name} ({code})",
+                                            "brand": "Plascon" if site.site_code.startswith("PLA") else None,
+                                            "product": name,
+                                            "code": code,
+                                            "kind": "OVERRIDE_EMAIL",
+                                            "role": None,
+                                            "aliases": [],
+                                        }
+                                    )
+                                    existing_codes.add(code)
+                                    added_codes.append(code)
+
+                                # If the user provided alias terms and we added exactly one product, attach those aliases.
+                                if alias_terms and len(added_codes) == 1:
+                                    code0 = added_codes[0]
+                                    for x in pps:
+                                        if str(x.get("code") or "").strip().replace(" ", "").upper() == code0:
+                                            al = list(x.get("aliases") or [])
+                                            for a in alias_terms:
+                                                if a and a not in al:
+                                                    al.append(a)
+                                            x["aliases"] = al
+
+                                pdata["paint_products"] = pps
+                                pdata["notes"] = str(pdata.get("notes") or "") + " | updated via ASSIST whitelist edit"
+                                products_path.write_text(json.dumps(pdata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+                                try:
+                                    import logging as _logging
+                                    _logging.getLogger("peter.email").info(
+                                        "WHITELIST_EDIT site=%s spec=%s/%s added=%s removed=%s",
+                                        site.site_code,
+                                        vlabel,
+                                        ssha[:12],
+                                        ",".join(added_codes) if added_codes else "-",
+                                        ",".join(sorted(remove_codes)) if remove_codes else "-",
+                                    )
+                                except Exception:
+                                    pass
+
+                                # Refresh whitelist confirmation text so the thread stays in sync
+                                confirm_name = f"{site.site_code}__WHITELIST_CONFIRMATION__{vlabel}__{ssha[:12]}.txt"
+                                confirm_path = sandbox.build_path("00_admin", confirm_name)
+                                try:
+                                    lines: list[str] = []
+                                    lines.append(f"ACTION REQUIRED: Confirm extracted product whitelist — {site.site_code} {vlabel}")
+                                    lines.append("")
+                                    lines.append(f"Site: {site.site_code}")
+                                    lines.append(f"Spec revision: {vlabel}")
+                                    lines.append(f"Spec hash: {ssha}")
+                                    lines.append("")
+                                    lines.append("Extracted allowed products (global union):")
+                                    def _role_key(x: dict[str, Any]) -> str:
+                                        return str(x.get("role") or "").strip().lower()
+                                    def _code_key(x: dict[str, Any]) -> str:
+                                        return str(x.get("code") or "").strip().upper()
+                                    def _name_key(x: dict[str, Any]) -> str:
+                                        return str(x.get("product") or x.get("name") or "").strip()
+                                    role_order = {"primer": 10, "undercoat": 20, "intermediate": 30, "topcoat": 40, "finish": 40, "surface conditioner": 90}
+                                    for it in sorted(pps, key=lambda x: (role_order.get(_role_key(x), 50), _role_key(x), _code_key(x), _name_key(x))):
+                                        code = (it.get("code") or "").strip()
+                                        name = (it.get("product") or it.get("name") or "").strip()
+                                        role = (it.get("role") or "").strip()
+                                        aliases = it.get("aliases") or []
+                                        if code:
+                                            base = f"- {code} — {name}" + (f" [{role}]" if role else "")
+                                        else:
+                                            base = f"- {name}" + (f" [{role}]" if role else "")
+                                        if aliases:
+                                            base += f" (aliases: {', '.join(str(a) for a in aliases)})"
+                                        lines.append(base)
+                                    lines.append("")
+                                    lines.append("Reply with: CONFIRM, or list changes (you can also just write naturally, e.g. 'Please add X (CODE)'.)")
+                                    confirm_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                                except Exception:
+                                    pass
+
+                                if not added_codes and not remove_codes:
+                                    status_line = "No changes needed (already up to date)."
+                                else:
+                                    status_line = "Changes applied."
+
+                                reply_text = (
+                                    f"OK — updated whitelist for {site.site_code} {vlabel}.\n"
+                                    + status_line
+                                    + "\n\n"
+                                    + (f"Added: {', '.join(added_codes)}\n" if added_codes else "")
+                                    + (f"Removed: {', '.join(sorted(remove_codes))}\n" if remove_codes else "")
+                                    + f"Allowlist file: {products_name}\n\n"
+                                    + "Next: re-send the QA REPORT email to re-run checks against the updated whitelist."
+                                )
+                                # Skip the general assist flow
+                                should_send = True
+                            else:
+                                from peter.interfaces.email.assist import run_assist
+                                reply_text = run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
+                        except Exception as _e_wh:
+                            # If whitelist edit fails, surface a short error so it doesn't silently look like it ignored the request.
+                            try:
+                                import logging as _logging
+                                _logging.getLogger("peter.email").error("WHITELIST_EDIT failed: %s", str(_e_wh)[:300])
+                            except Exception:
+                                pass
+                            from peter.interfaces.email.assist import run_assist
+                            reply_text = (
+                                "I tried to apply your whitelist edit automatically but hit an error. "
+                                f"Error: {str(_e_wh)[:200]}\n\n"
+                                "I can still help—here’s my analysis while we fix the automation:\n\n"
+                                + run_assist(conn=conn, settings=self.settings, site_code=cmd.site_code, request=req)
+                            )
                     else:
                         # If subject is not recognized:
                         # - If there is a known site code in the subject, treat as ASSIST (conversational).

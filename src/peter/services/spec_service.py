@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 from peter.db.repositories.site_repo import SiteRepository
 from peter.db.repositories.spec_repo import SpecRepository, SpecRow
@@ -63,30 +64,52 @@ class SpecService:
         sha = sha256_file(path)
         existing = self.spec_repo.get_by_site_sha(site.id, sha)
         if existing:
-            # idempotent: ensure derived artifacts exist (best-effort)
+            # Idempotent: ensure derived artifacts exist (best-effort).
+            # IMPORTANT: prefer SPEC_PACK as source of truth for PRODUCTS + whitelist confirmation.
             try:
-                # If extracted text exists (or can be regenerated), ensure product allowlist exists.
-                from peter.knowledge.spec_products import extract_allowed_products
-
                 sandbox = ensure_site_folders(self.settings, folder_name=site.folder_name)
+                admin_dir = sandbox.build_path("00_admin")
+
+                # Load extracted spec text if present
                 txt_name_glob = f"{site.site_code}__SPEC__{vlabel}__{sha[:12]}*.txt"
-                txt_files = list(sandbox.build_path("00_admin").glob(txt_name_glob))
+                txt_files = list(admin_dir.glob(txt_name_glob))
                 spec_text = txt_files[0].read_text(encoding="utf-8", errors="replace") if txt_files else ""
 
                 products_name = f"{site.site_code}__PRODUCTS__{vlabel}__{sha[:12]}.json"
                 products_path = sandbox.build_path("00_admin", products_name)
-                if spec_text and not products_path.exists():
-                    use_openai = os.getenv("PETER_SPEC_PRODUCTS_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
-                    model = os.getenv("PETER_SPEC_PRODUCTS_MODEL", "gpt-4.1")
-                    products = extract_allowed_products(spec_text=spec_text, use_openai=use_openai, model=model)
+
+                # Try to (re)build PRODUCTS from SPEC_PACK if available
+                paint_products: list[dict[str, Any]] = []
+                pack_name = f"{site.site_code}__SPEC_PACK__{vlabel}__{sha[:12]}.json"
+                pack_path = sandbox.build_path("00_admin", pack_name)
+                if pack_path.exists():
+                    pack_payload = json.loads(pack_path.read_text(encoding="utf-8"))
+                    for ap in (pack_payload.get("allowed_products") or []):
+                        code = ap.get("code")
+                        name = ap.get("name")
+                        aliases = ap.get("aliases") or []
+                        brand = ap.get("brand")
+                        role = ap.get("role")
+                        paint_products.append(
+                            {
+                                "raw_mention": f"{name} ({code})" if code else str(name or ""),
+                                "brand": brand,
+                                "product": name,
+                                "code": code,
+                                "kind": "SPEC_PACK",
+                                "role": role,
+                                "aliases": aliases,
+                            }
+                        )
+                    # Always overwrite so we don't get stuck with an empty legacy file.
                     products_path.write_text(
                         json.dumps(
                             {
                                 "site_code": site.site_code,
                                 "version": vlabel,
                                 "sha256": sha,
-                                "paint_products": [p.__dict__ for p in products if p.kind == "PAINT"],
-                                "notes": "Generated from spec text; strict allowlist (paint only).",
+                                "paint_products": paint_products,
+                                "notes": "Derived from SPEC_PACK.allowed_products (preferred source of truth).",
                             },
                             indent=2,
                             ensure_ascii=False,
@@ -94,6 +117,75 @@ class SpecService:
                         + "\n",
                         encoding="utf-8",
                     )
+                else:
+                    # Fallback: legacy heuristic extraction (only if PRODUCTS missing)
+                    if spec_text and not products_path.exists():
+                        from peter.knowledge.spec_products import extract_allowed_products
+
+                        use_openai = os.getenv("PETER_SPEC_PRODUCTS_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
+                        model = os.getenv("PETER_SPEC_PRODUCTS_MODEL", "gpt-4.1")
+                        products = extract_allowed_products(spec_text=spec_text, use_openai=use_openai, model=model)
+                        paint_products = [p.__dict__ for p in products if p.kind == "PAINT"]
+                        products_path.write_text(
+                            json.dumps(
+                                {
+                                    "site_code": site.site_code,
+                                    "version": vlabel,
+                                    "sha256": sha,
+                                    "paint_products": paint_products,
+                                    "notes": "Generated from spec text; strict allowlist (paint only).",
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+
+                # Ensure whitelist confirmation draft exists (built from current PRODUCTS list)
+                try:
+                    if not paint_products and products_path.exists():
+                        try:
+                            pdata = json.loads(products_path.read_text(encoding="utf-8"))
+                            paint_products = pdata.get("paint_products") or []
+                        except Exception:
+                            paint_products = []
+
+                    email_name = f"{site.site_code}__WHITELIST_CONFIRMATION__{vlabel}__{sha[:12]}.txt"
+                    email_path = sandbox.build_path("00_admin", email_name)
+                    if not email_path.exists():
+                        lines: list[str] = []
+                        lines.append(f"ACTION REQUIRED: Confirm extracted product whitelist — {site.site_code} {vlabel}")
+                        lines.append("")
+                        lines.append(f"Site: {site.site_code}")
+                        lines.append(f"Spec revision: {vlabel}")
+                        lines.append(f"Spec hash: {sha}")
+                        lines.append("")
+                        lines.append("Extracted allowed products (global union):")
+                        def _role_key(x: dict[str, Any]) -> str:
+                            return str(x.get("role") or "").strip().lower()
+                        def _code_key(x: dict[str, Any]) -> str:
+                            return str(x.get("code") or "").strip().upper()
+                        def _name_key(x: dict[str, Any]) -> str:
+                            return str(x.get("product") or x.get("name") or "").strip()
+                        role_order = {"primer": 10, "undercoat": 20, "intermediate": 30, "topcoat": 40, "finish": 40, "surface conditioner": 90}
+                        for it in sorted(paint_products, key=lambda x: (role_order.get(_role_key(x), 50), _role_key(x), _code_key(x), _name_key(x))):
+                            code = (it.get("code") or "").strip()
+                            name = (it.get("product") or it.get("name") or "").strip()
+                            role = (it.get("role") or "").strip()
+                            aliases = it.get("aliases") or []
+                            if code:
+                                base = f"- {code} — {name}" + (f" [{role}]" if role else "")
+                            else:
+                                base = f"- {name}" + (f" [{role}]" if role else "")
+                            if aliases:
+                                base += f" (aliases: {', '.join(str(a) for a in aliases)})"
+                            lines.append(base)
+                        lines.append("")
+                        lines.append("Reply with: CONFIRM, or list changes (REMOVE / ADD / ADD ALIAS).")
+                        email_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
             except Exception:
                 pass
             return existing
@@ -137,49 +229,131 @@ class SpecService:
                 use_openai = os.getenv("PETER_SPEC_PRODUCTS_USE_OPENAI", "1").strip().lower() in ("1", "true", "yes")
                 model = os.getenv("PETER_SPEC_PRODUCTS_MODEL", "gpt-4.1")
                 products = extract_allowed_products(spec_text=spec_text, use_openai=use_openai, model=model)
+
                 products_name = f"{site.site_code}__PRODUCTS__{vlabel}__{sha[:12]}.json"
                 products_path = sandbox.build_path("00_admin", products_name)
-                products_path.write_text(
-                    json.dumps(
-                        {
-                            "site_code": site.site_code,
-                            "version": vlabel,
-                            "sha256": sha,
-                            "paint_products": [p.__dict__ for p in products if p.kind == "PAINT"],
-                            "notes": "Generated from spec text; strict allowlist (paint only).",
-                        },
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
 
                 # Build a richer spec pack (spec type + product roles + role rules)
+                pack_payload: dict[str, Any] | None = None
                 try:
                     if os.getenv("PETER_SPEC_PACK_ENABLED", "1").strip().lower() in ("1", "true", "yes"):
                         from peter.knowledge.spec_pack import extract_spec_pack
 
                         pack = extract_spec_pack(spec_text=spec_text)
+                        pack_payload = {
+                            "site_code": site.site_code,
+                            "version": vlabel,
+                            "sha256": sha,
+                            "spec_type": pack.spec_type,
+                            "supplier_prefix": pack.supplier_prefix,
+                            "allowed_products": pack.allowed_products,
+                            "role_rules": pack.role_rules,
+                        }
                         pack_name = f"{site.site_code}__SPEC_PACK__{vlabel}__{sha[:12]}.json"
                         pack_path = sandbox.build_path("00_admin", pack_name)
-                        pack_path.write_text(
-                            json.dumps(
-                                {
-                                    "site_code": site.site_code,
-                                    "version": vlabel,
-                                    "sha256": sha,
-                                    "spec_type": pack.spec_type,
-                                    "supplier_prefix": pack.supplier_prefix,
-                                    "allowed_products": pack.allowed_products,
-                                    "role_rules": pack.role_rules,
-                                },
-                                indent=2,
-                                ensure_ascii=False,
-                            )
-                            + "\n",
-                            encoding="utf-8",
+                        pack_path.write_text(json.dumps(pack_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                except Exception:
+                    pack_payload = None
+
+                # Write product allowlist used by report checks.
+                # IMPORTANT: prefer SPEC_PACK.allowed_products (roles + codes) as source of truth.
+                paint_products: list[dict[str, Any]] = []
+
+                if pack_payload and (pack_payload.get("allowed_products") or []):
+                    for ap in (pack_payload.get("allowed_products") or []):
+                        code = ap.get("code")
+                        name = ap.get("name")
+                        aliases = ap.get("aliases") or []
+                        brand = ap.get("brand")
+                        role = ap.get("role")
+                        # Keep the on-disk schema compatible with ProductAllowlist.load_allowlist
+                        paint_products.append(
+                            {
+                                "raw_mention": f"{name} ({code})" if code else str(name or ""),
+                                "brand": brand,
+                                "product": name,
+                                "code": code,
+                                "kind": "SPEC_PACK",  # informational only
+                                "role": role,
+                                "aliases": aliases,
+                            }
                         )
+
+                    products_path.write_text(
+                        json.dumps(
+                            {
+                                "site_code": site.site_code,
+                                "version": vlabel,
+                                "sha256": sha,
+                                "paint_products": paint_products,
+                                "notes": "Derived from SPEC_PACK.allowed_products (preferred source of truth).",
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    # Fallback: legacy heuristic extraction (best-effort)
+                    paint_products = [p.__dict__ for p in products if p.kind == "PAINT"]
+                    products_path.write_text(
+                        json.dumps(
+                            {
+                                "site_code": site.site_code,
+                                "version": vlabel,
+                                "sha256": sha,
+                                "paint_products": paint_products,
+                                "notes": "Generated from spec text; strict allowlist (paint only).",
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+
+                # Produce a technician-facing confirmation email draft (not sent automatically).
+                try:
+                    lines: list[str] = []
+                    lines.append(f"ACTION REQUIRED: Confirm extracted product whitelist — {site.site_code} {vlabel}")
+                    lines.append("")
+                    lines.append(f"Site: {site.site_code}")
+                    lines.append(f"Spec revision: {vlabel}")
+                    lines.append(f"Spec hash: {sha}")
+                    lines.append("")
+                    lines.append("Extracted allowed products (global union):")
+                    # Stable sort: by role then code/name
+                    def _role_key(x: dict[str, Any]) -> str:
+                        return str(x.get("role") or "").strip().lower()
+
+                    def _code_key(x: dict[str, Any]) -> str:
+                        return str(x.get("code") or "").strip().upper()
+
+                    def _name_key(x: dict[str, Any]) -> str:
+                        return str(x.get("product") or x.get("name") or "").strip()
+
+                    role_order = {"primer": 10, "undercoat": 20, "intermediate": 30, "topcoat": 40, "finish": 40, "surface conditioner": 90}
+
+                    for it in sorted(paint_products, key=lambda x: (role_order.get(_role_key(x), 50), _role_key(x), _code_key(x), _name_key(x))):
+                        code = (it.get("code") or "").strip()
+                        name = (it.get("product") or it.get("name") or "").strip()
+                        role = (it.get("role") or "").strip()
+                        aliases = it.get("aliases") or []
+                        if code:
+                            base = f"- {code} — {name}" + (f" [{role}]" if role else "")
+                        else:
+                            base = f"- {name}" + (f" [{role}]" if role else "")
+                        if aliases:
+                            base += f" (aliases: {', '.join(str(a) for a in aliases)})"
+                        lines.append(base)
+
+                    lines.append("")
+                    lines.append("Reply with: CONFIRM, or list changes (REMOVE / ADD / ADD ALIAS).")
+
+                    email_name = f"{site.site_code}__WHITELIST_CONFIRMATION__{vlabel}__{sha[:12]}.txt"
+                    email_path = sandbox.build_path("00_admin", email_name)
+                    email_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 except Exception:
                     pass
 

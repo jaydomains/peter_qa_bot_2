@@ -38,9 +38,15 @@ def load_allowlist(products_json_path: Path) -> ProductAllowlist:
 
 
 def match_observed(*, allow: ProductAllowlist, raw_text: str, code: str | None) -> bool:
+    # Code match (tolerant): normalize, drop spaces, and strip common trailing DFT/range tokens
+    # e.g. "VEL/TDV(25/35)" should match allowlist code "VEL/TDV".
     if code:
-        c = _norm(code).replace(" ", "")
-        if c in {x.replace(" ", "") for x in allow.codes}:
+        c0 = _norm(code).replace(" ", "")
+        c = re.sub(r"[^A-Z0-9/-]+", "", c0)
+        # also try removing any embedded numeric range suffixes that some OCR/extractors append
+        c_base = re.sub(r"\d{2,4}/\d{2,4}$", "", c)
+        allow_codes = {re.sub(r"[^A-Z0-9/-]+", "", x.replace(" ", "")) for x in allow.codes}
+        if c in allow_codes or c_base in allow_codes:
             return True
 
     t = _norm(raw_text)
